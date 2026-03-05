@@ -26,6 +26,7 @@ import json
 import logging
 logger = logging.getLogger(__name__)
 import os
+import queue
 import random
 import re
 import sys
@@ -140,6 +141,8 @@ class AIAgent:
         skip_memory: bool = False,
         session_db=None,
         honcho_session_key: str = None,
+        event_queue: "queue.Queue | None" = None,
+        extra_tags: List[str] = None,
     ):
         """
         Initialize the AI Agent.
@@ -217,6 +220,8 @@ class AIAgent:
         self.tool_progress_callback = tool_progress_callback
         self.clarify_callback = clarify_callback
         self.step_callback = step_callback
+        self.event_queue: queue.Queue | None = event_queue
+        self._extra_tags: List[str] = extra_tags or []
         self._last_reported_tool = None  # Track for "new tool" mode
         
         # Interrupt mechanism for breaking out of tool loops
@@ -255,7 +260,7 @@ class AIAgent:
         # Persistent error log -- always writes WARNING+ to ~/.hermes/logs/errors.log
         # so tool failures, API errors, etc. are inspectable after the fact.
         from agent.redact import RedactingFormatter
-        _error_log_dir = Path.home() / ".hermes" / "logs"
+        _error_log_dir = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "logs"
         _error_log_dir.mkdir(parents=True, exist_ok=True)
         _error_log_path = _error_log_dir / "errors.log"
         from logging.handlers import RotatingFileHandler
@@ -1305,6 +1310,19 @@ class AIAgent:
         except Exception as e:
             logger.debug("Honcho sync failed (non-fatal): %s", e)
 
+    def _emit_event(self, event: Dict[str, Any]) -> None:
+        """Push a structured event onto the event queue (if one is attached).
+
+        Used by the serve layer to stream intermediate agent progress
+        (text tokens, tool calls, tool results) back to callers over SSE.
+        No-op when ``event_queue`` is ``None`` (CLI / gateway usage).
+        """
+        if self.event_queue is not None:
+            try:
+                self.event_queue.put_nowait(event)
+            except Exception:
+                pass
+
     def _build_system_prompt(self, system_message: str = None) -> str:
         """
         Assemble the full system prompt from all layers.
@@ -2136,9 +2154,11 @@ class AIAgent:
                     "effort": "xhigh"
                 }
 
-        # Nous Portal product attribution
+        # Nous Portal product attribution + caller-supplied tags
         if _is_nous:
-            extra_body["tags"] = ["product=hermes-agent"]
+            tags = list(self._extra_tags)
+            tags.append("product=hermes-agent")
+            extra_body["tags"] = tags
 
         if extra_body:
             api_kwargs["extra_body"] = extra_body
@@ -2454,6 +2474,13 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
+            self._emit_event({
+                "type": "tool-call",
+                "name": function_name,
+                "args": function_args,
+                "status": "calling",
+            })
+
             tool_start_time = time.time()
 
             if function_name == "todo":
@@ -2616,6 +2643,14 @@ class AIAgent:
             }
             messages.append(tool_msg)
             self._log_msg_to_db(tool_msg)
+
+            self._emit_event({
+                "type": "tool-result",
+                "name": function_name,
+                "output": function_result[:4000],
+                "status": "complete",
+                "duration": round(tool_duration, 2),
+            })
 
             if not self.quiet_mode:
                 response_preview = function_result[:self.log_prefix_chars] + "..." if len(function_result) > self.log_prefix_chars else function_result
@@ -3779,6 +3814,9 @@ class AIAgent:
                     
                     # Strip <think> blocks from user-facing response (keep raw in messages for trajectory)
                     final_response = self._strip_think_blocks(final_response).strip()
+
+                    if final_response:
+                        self._emit_event({"type": "text", "text": final_response})
                     
                     final_msg = self._build_assistant_message(assistant_message, finish_reason)
                     
@@ -3875,6 +3913,8 @@ class AIAgent:
         
         # Clear interrupt state after handling
         self.clear_interrupt()
+
+        self._emit_event({"type": "done"})
         
         return result
     

@@ -54,8 +54,9 @@ ENVIRONMENTS_DIR = TINKER_ATROPOS_ROOT / "tinker_atropos" / "environments"
 CONFIGS_DIR = TINKER_ATROPOS_ROOT / "configs"
 LOGS_DIR = TINKER_ATROPOS_ROOT / "logs"
 
-# Ensure logs directory exists
-LOGS_DIR.mkdir(exist_ok=True)
+# Ensure logs directory exists (parents=True for container environments
+# where tinker-atropos may not be checked out)
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================================
