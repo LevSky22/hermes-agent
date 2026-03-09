@@ -29,6 +29,18 @@ Example config::
         headers:
           Authorization: "Bearer sk-..."
         timeout: 180
+      analysis:
+        command: "npx"
+        args: ["-y", "analysis-server"]
+        sampling:                    # server-initiated LLM requests
+          enabled: true              # default: true
+          model: "gemini-3-flash"    # override model (optional)
+          max_tokens_cap: 4096       # max tokens per request
+          timeout: 30                # LLM call timeout (seconds)
+          max_rpm: 10                # max requests per minute
+          allowed_models: []         # model whitelist (empty = all)
+          max_tool_rounds: 5         # tool loop limit (0 = disable)
+          log_level: "info"          # audit verbosity
 
 Features:
     - Stdio transport (command + args) and HTTP/StreamableHTTP transport (url)
@@ -37,6 +49,8 @@ Features:
     - Credential stripping in error messages returned to the LLM
     - Configurable per-server timeouts for tool calls and connections
     - Thread-safe architecture with dedicated background event loop
+    - Sampling support: MCP servers can request LLM completions via
+      sampling/createMessage (text and tool-use responses)
 
 Architecture:
     A dedicated background event loop (_mcp_loop) runs in a daemon thread.
