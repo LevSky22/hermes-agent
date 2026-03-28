@@ -37,6 +37,8 @@ _PREFIX_PATTERNS = [
     r"dop_v1_[A-Za-z0-9]{10,}",         # DigitalOcean PAT
     r"doo_v1_[A-Za-z0-9]{10,}",         # DigitalOcean OAuth
     r"am_[A-Za-z0-9_-]{10,}",           # AgentMail API key
+    r"AC[a-fA-F0-9]{32}",               # Twilio Account SID
+    r"SK[a-fA-F0-9]{32}",               # Twilio API Key SID / Secret SID-like identifiers
 ]
 
 # ENV assignment patterns: KEY=value where KEY contains a secret-like name
@@ -64,6 +66,17 @@ _AUTH_HEADER_RE = re.compile(
 _TELEGRAM_RE = re.compile(
     r"(bot)?(\d{8,}):([-A-Za-z0-9_]{30,})",
 )
+
+# JWTs: three base64url-ish segments separated by dots.
+# Keep threshold moderately high to avoid redacting short dotted identifiers.
+_JWT_RE = re.compile(
+    r"\b([A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,})\b"
+)
+
+# Twilio auth tokens are commonly plain 32-char lowercase hex strings.
+# This may also match some MD5-like identifiers, but we prefer false positives
+# over leaking a credential into model context.
+_TWILIO_AUTH_TOKEN_RE = re.compile(r"\b([a-f0-9]{32})\b")
 
 # Private key blocks: -----BEGIN RSA PRIVATE KEY----- ... -----END RSA PRIVATE KEY-----
 _PRIVATE_KEY_RE = re.compile(
@@ -136,6 +149,12 @@ def redact_sensitive_text(text: str) -> str:
         digits = m.group(2)
         return f"{prefix}{digits}:***"
     text = _TELEGRAM_RE.sub(_redact_telegram, text)
+
+    # JWTs
+    text = _JWT_RE.sub(lambda m: _mask_token(m.group(1)), text)
+
+    # Twilio auth tokens / bare 32-char lowercase hex tokens
+    text = _TWILIO_AUTH_TOKEN_RE.sub(lambda m: _mask_token(m.group(1)), text)
 
     # Private key blocks
     text = _PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
