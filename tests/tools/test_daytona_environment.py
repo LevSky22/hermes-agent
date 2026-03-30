@@ -61,6 +61,9 @@ def make_env(daytona_sdk, monkeypatch):
     """Factory that creates a DaytonaEnvironment with a mocked SDK."""
     # Prevent is_interrupted from interfering
     monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+    # Prevent skills/credential sync from consuming mock exec calls
+    monkeypatch.setattr("tools.credential_files.get_credential_file_mounts", lambda: [])
+    monkeypatch.setattr("tools.credential_files.get_skills_directory_mount", lambda **kw: None)
 
     def _factory(
         sandbox=None,

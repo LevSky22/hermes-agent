@@ -83,7 +83,7 @@ def register_credential_files(
         if isinstance(entry, str):
             rel_path = entry.strip()
         elif isinstance(entry, dict):
-            rel_path = (entry.get("path") or "").strip()
+            rel_path = (entry.get("path") or entry.get("name") or "").strip()
         else:
             continue
         if not rel_path:
@@ -150,6 +150,28 @@ def get_credential_file_mounts() -> List[Dict[str, str]]:
         {"host_path": hp, "container_path": cp}
         for cp, hp in mounts.items()
     ]
+
+
+def get_skills_directory_mount(
+    container_base: str = "/root/.hermes",
+) -> Dict[str, str] | None:
+    """Return mount info for the skills directory, or None if it doesn't exist.
+
+    Skills may include ``scripts/``, ``templates/``, and ``references/``
+    subdirectories that the agent needs to execute inside remote sandboxes.
+    This mounts the entire ``$HERMES_HOME/skills/`` tree read-only so
+    skill scripts are available at the same relative path the agent expects.
+
+    Returns a dict with ``host_path`` and ``container_path`` keys, or None.
+    """
+    hermes_home = _resolve_hermes_home()
+    skills_dir = hermes_home / "skills"
+    if not skills_dir.is_dir():
+        return None
+    return {
+        "host_path": str(skills_dir),
+        "container_path": f"{container_base.rstrip('/')}/skills",
+    }
 
 
 def clear_credential_files() -> None:
