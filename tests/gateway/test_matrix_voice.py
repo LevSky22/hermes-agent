@@ -4,6 +4,8 @@ import io
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+nio = pytest.importorskip("nio", reason="matrix-nio not installed")
+
 from gateway.platforms.base import MessageType
 
 
