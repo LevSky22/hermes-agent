@@ -103,6 +103,7 @@ class TestAppMentionHandler:
         # Track which events get registered
         registered_events = []
         registered_commands = []
+        registered_actions = []
 
         mock_app = MagicMock()
 
@@ -118,8 +119,15 @@ class TestAppMentionHandler:
                 return fn
             return decorator
 
+        def mock_action(action_id):
+            def decorator(fn):
+                registered_actions.append(action_id)
+                return fn
+            return decorator
+
         mock_app.event = mock_event
         mock_app.command = mock_command
+        mock_app.action = mock_action
         mock_app.client = AsyncMock()
         mock_app.client.auth_test = AsyncMock(return_value={
             "user_id": "U_BOT",
@@ -146,6 +154,58 @@ class TestAppMentionHandler:
         assert "message" in registered_events
         assert "app_mention" in registered_events
         assert "/hermes" in registered_commands
+        assert "hermes_approve_once" in registered_actions
+        assert "hermes_approve_session" in registered_actions
+        assert "hermes_deny" in registered_actions
+
+
+class TestSlackApprovalButtons:
+    @pytest.mark.asyncio
+    async def test_send_exec_approval_posts_buttons(self, adapter):
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "123.456"})
+
+        result = await adapter.send_exec_approval(
+            chat_id="C123",
+            command="rm -rf /tmp/test",
+            approval_id="approval-1",
+            metadata={"thread_id": "123.000"},
+        )
+
+        assert result.success
+        call_kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
+        assert call_kwargs["channel"] == "C123"
+        assert call_kwargs["thread_ts"] == "123.000"
+        assert call_kwargs["blocks"][1]["elements"][0]["action_id"] == "hermes_approve_once"
+        assert call_kwargs["blocks"][1]["elements"][1]["action_id"] == "hermes_approve_session"
+        assert call_kwargs["blocks"][1]["elements"][2]["action_id"] == "hermes_deny"
+
+    @pytest.mark.asyncio
+    async def test_handle_approval_action_invokes_platform_handler_and_updates_thread(self, adapter):
+        adapter._approval_action_handler = AsyncMock(return_value="approved output")
+        adapter.send = AsyncMock(return_value=SendResult(success=True))
+        adapter._app.client.chat_update = AsyncMock()
+
+        body = {
+            "channel": {"id": "C123"},
+            "user": {"id": "U123"},
+            "container": {"message_ts": "200.000", "thread_ts": "100.000"},
+            "message": {"ts": "200.000", "thread_ts": "100.000"},
+            "actions": [{"value": "approval-1"}],
+        }
+
+        await adapter._handle_approval_action(body, "approve session")
+
+        adapter._approval_action_handler.assert_awaited_once_with("approval-1", "approve session")
+        adapter._app.client.chat_update.assert_awaited_once()
+        update_kwargs = adapter._app.client.chat_update.call_args.kwargs
+        assert update_kwargs["channel"] == "C123"
+        assert update_kwargs["ts"] == "200.000"
+        assert "Approved for session" in update_kwargs["text"]
+        adapter.send.assert_awaited_once_with(
+            "C123",
+            "approved output",
+            metadata={"thread_id": "100.000"},
+        )
 
 
 # ---------------------------------------------------------------------------

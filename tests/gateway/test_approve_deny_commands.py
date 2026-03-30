@@ -338,6 +338,75 @@ class TestDenyCommand:
         assert "No pending command" in result
 
 
+class TestPlatformApprovalActions:
+
+    @pytest.mark.asyncio
+    async def test_platform_approve_once_executes_pending_command(self):
+        runner = _make_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        runner._pending_approvals[session_key] = _make_pending_approval()
+
+        with (
+            patch("tools.terminal_tool.terminal_tool", return_value="done") as mock_term,
+            patch("tools.approval.approve_session") as mock_session,
+        ):
+            result = await runner._handle_platform_approval_action(session_key, "approve")
+
+        assert "✅ Command approved and executed" in result
+        mock_session.assert_called_once_with(session_key, "sudo")
+        mock_term.assert_called_once_with(command="sudo rm -rf /tmp/test", force=True)
+        assert session_key not in runner._pending_approvals
+
+    @pytest.mark.asyncio
+    async def test_platform_approve_session_marks_session_scope(self):
+        runner = _make_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        runner._pending_approvals[session_key] = _make_pending_approval()
+
+        with (
+            patch("tools.terminal_tool.terminal_tool", return_value="done"),
+            patch("tools.approval.approve_session") as mock_session,
+        ):
+            result = await runner._handle_platform_approval_action(session_key, "approve session")
+
+        assert "pattern approved for this session" in result
+        mock_session.assert_called_once_with(session_key, "sudo")
+
+    @pytest.mark.asyncio
+    async def test_platform_deny_clears_pending(self):
+        runner = _make_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        runner._pending_approvals[session_key] = _make_pending_approval()
+
+        result = await runner._handle_platform_approval_action(session_key, "deny")
+
+        assert "❌ Command denied" in result
+        assert session_key not in runner._pending_approvals
+
+    @pytest.mark.asyncio
+    async def test_platform_approval_invalid_action(self):
+        runner = _make_runner()
+        result = await runner._handle_platform_approval_action("approval-1", "maybe")
+        assert "Unsupported approval action" in result
+
+    @pytest.mark.asyncio
+    async def test_platform_approval_expired(self):
+        runner = _make_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        approval = _make_pending_approval()
+        approval["timestamp"] = time.time() - 600
+        runner._pending_approvals[session_key] = approval
+
+        result = await runner._handle_platform_approval_action(session_key, "approve")
+
+        assert "expired" in result
+        assert session_key not in runner._pending_approvals
+
+
 # ------------------------------------------------------------------
 # Bare "yes" must NOT trigger approval
 # ------------------------------------------------------------------
