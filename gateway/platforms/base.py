@@ -402,6 +402,7 @@ _RETRYABLE_ERROR_PATTERNS = (
 
 # Type for message handlers
 MessageHandler = Callable[[MessageEvent], Awaitable[Optional[str]]]
+ApprovalActionHandler = Callable[[str, str], Awaitable[Optional[str]]]
 
 
 class BasePlatformAdapter(ABC):
@@ -419,6 +420,7 @@ class BasePlatformAdapter(ABC):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        self._approval_action_handler: Optional[ApprovalActionHandler] = None
         self._running = False
         self._fatal_error_code: Optional[str] = None
         self._fatal_error_message: Optional[str] = None
@@ -518,6 +520,17 @@ class BasePlatformAdapter(ABC):
         an optional response string.
         """
         self._message_handler = handler
+
+    def set_approval_action_handler(self, handler: ApprovalActionHandler) -> None:
+        """
+        Set the handler for platform-native approval actions.
+
+        The handler receives ``(approval_id, action)`` where ``approval_id`` is
+        the opaque platform-provided approval token and ``action`` is one of
+        the platform's canonical approval actions such as ``approve``,
+        ``approve session``, or ``deny``.
+        """
+        self._approval_action_handler = handler
     
     @abstractmethod
     async def connect(self) -> bool:

@@ -1115,6 +1115,7 @@ class GatewayRunner:
             
             # Set up message + fatal error handlers
             adapter.set_message_handler(self._handle_message)
+            adapter.set_approval_action_handler(self._handle_platform_approval_action)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             
             # Try to connect
@@ -1362,6 +1363,7 @@ class GatewayRunner:
                         continue
 
                     adapter.set_message_handler(self._handle_message)
+                    adapter.set_approval_action_handler(self._handle_platform_approval_action)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
 
                     success = await adapter.connect()
@@ -5093,6 +5095,49 @@ class GatewayRunner:
     # ------------------------------------------------------------------
 
     _APPROVAL_TIMEOUT_SECONDS = 300  # 5 minutes
+
+    async def _handle_platform_approval_action(
+        self,
+        approval_id: str,
+        action: str,
+    ) -> str:
+        """Resolve a pending dangerous-command approval by approval ID.
+
+        Messaging platforms with native UI controls, such as Slack buttons,
+        should call this directly instead of synthesizing a new slash-command
+        message. The approval ID is the stored session key for the pending
+        command. Signals the blocked agent thread via the blocking gateway
+        approval mechanism in tools/approval.py.
+        """
+        session_key = (approval_id or "").strip()
+        if not session_key:
+            return "Invalid approval request."
+
+        canonical = action.strip().lower()
+        if canonical not in {"approve", "approve session", "deny"}:
+            return f"Unsupported approval action: {action}"
+
+        from tools.approval import resolve_gateway_approval, has_blocking_approval
+
+        if not has_blocking_approval(session_key):
+            return "No pending command to approve."
+
+        choice = "deny" if canonical == "deny" else ("session" if canonical == "approve session" else "once")
+        scope_msg = " (pattern approved for this session)" if choice == "session" else ""
+
+        count = resolve_gateway_approval(session_key, choice)
+        if not count:
+            return "No pending command to approve."
+
+        if choice == "deny":
+            logger.info("User denied dangerous command via platform approval UI")
+            return "❌ Command denied."
+
+        logger.info(
+            "User approved dangerous command via platform approval UI%s",
+            scope_msg,
+        )
+        return f"✅ Command approved{scope_msg}. The agent is resuming..."
 
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve command — unblock waiting agent thread(s).

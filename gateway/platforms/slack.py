@@ -176,6 +176,21 @@ class SlackAdapter(BasePlatformAdapter):
                 await ack()
                 await self._handle_slash_command(command)
 
+            @self._app.action("hermes_approve_once")
+            async def handle_approve_once(ack, body, action):
+                await ack()
+                await self._handle_approval_action(body, "approve")
+
+            @self._app.action("hermes_approve_session")
+            async def handle_approve_session(ack, body, action):
+                await ack()
+                await self._handle_approval_action(body, "approve session")
+
+            @self._app.action("hermes_deny")
+            async def handle_deny(ack, body, action):
+                await ack()
+                await self._handle_approval_action(body, "deny")
+
             # Start Socket Mode handler in background
             self._handler = AsyncSocketModeHandler(self._app, app_token)
             self._socket_mode_task = asyncio.create_task(self._handler.start_async())
@@ -932,6 +947,125 @@ class SlackAdapter(BasePlatformAdapter):
         )
 
         await self.handle_message(event)
+
+    async def _handle_approval_action(self, body: dict, command_text: str) -> None:
+        """Handle Slack Block Kit approval buttons inside a thread or DM.
+
+        Slack slash commands do not work inside threads, so approvals use
+        buttons that resolve the pending approval directly by approval ID.
+        """
+        if not self._approval_action_handler:
+            return
+
+        channel = body.get("channel") or {}
+        user = body.get("user") or {}
+        message = body.get("message") or {}
+        container = body.get("container") or {}
+        actions = body.get("actions") or []
+
+        channel_id = channel.get("id", "")
+        user_id = user.get("id", "")
+        approval_id = actions[0].get("value", "") if actions else ""
+
+        actual_thread_ts = (
+            container.get("thread_ts")
+            or message.get("thread_ts")
+            or message.get("ts")
+        )
+
+        try:
+            response = await self._approval_action_handler(approval_id, command_text)
+        except Exception as e:  # pragma: no cover - defensive logging
+            logger.error("[Slack] Approval action failed: %s", e, exc_info=True)
+            response = f"❌ Approval action failed: {e}"
+
+        try:
+            action_label = {
+                "approve": "Approved once",
+                "approve session": "Approved for session",
+                "deny": "Denied",
+            }.get(command_text, command_text)
+            await self._app.client.chat_update(
+                channel=channel_id,
+                ts=container.get("message_ts") or message.get("ts"),
+                text=f"✅ {action_label} by <@{user_id}>",
+                blocks=[],
+            )
+        except Exception:
+            pass
+
+        if response:
+            metadata = {"thread_id": actual_thread_ts} if actual_thread_ts else None
+            await self.send(channel_id, response, metadata=metadata)
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        approval_id: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a Slack Block Kit approval prompt for a dangerous command."""
+        if not self._app:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            max_text = 2700
+            cmd_display = command if len(command) <= max_text else command[: max_text - 3] + "..."
+            thread_ts = self._resolve_thread_ts(reply_to, metadata)
+
+            blocks = [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            "*Dangerous command requires approval*\n"
+                            f"```{cmd_display}```"
+                        ),
+                    },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Approve Once"},
+                            "style": "primary",
+                            "action_id": "hermes_approve_once",
+                            "value": approval_id,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Approve Session"},
+                            "action_id": "hermes_approve_session",
+                            "value": approval_id,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Deny"},
+                            "style": "danger",
+                            "action_id": "hermes_deny",
+                            "value": approval_id,
+                        },
+                    ],
+                },
+            ]
+
+            kwargs = {
+                "channel": chat_id,
+                "text": "Dangerous command requires approval",
+                "blocks": blocks,
+            }
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+
+            result = await self._app.client.chat_postMessage(**kwargs)
+            return SendResult(success=True, message_id=result.get("ts"), raw_response=result)
+        except Exception as e:  # pragma: no cover - defensive logging
+            logger.error("[Slack] Failed to send approval prompt: %s", e, exc_info=True)
+            return SendResult(success=False, error=str(e))
 
     async def _download_slack_file(self, url: str, ext: str, audio: bool = False, team_id: str = "") -> str:
         """Download a Slack file using the bot token for auth, with retry."""
