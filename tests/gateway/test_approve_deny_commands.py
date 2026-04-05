@@ -345,46 +345,45 @@ class TestPlatformApprovalActions:
         runner = _make_runner()
         source = _make_source()
         session_key = runner._session_key_for_source(source)
-        runner._pending_approvals[session_key] = _make_pending_approval()
 
         with (
-            patch("tools.terminal_tool.terminal_tool", return_value="done") as mock_term,
-            patch("tools.approval.approve_session") as mock_session,
+            patch("tools.approval.has_blocking_approval", return_value=True),
+            patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve,
         ):
             result = await runner._handle_platform_approval_action(session_key, "approve")
 
-        assert "✅ Command approved and executed" in result
-        mock_session.assert_called_once_with(session_key, "sudo")
-        mock_term.assert_called_once_with(command="sudo rm -rf /tmp/test", force=True)
-        assert session_key not in runner._pending_approvals
+        assert "✅ Command approved" in result
+        mock_resolve.assert_called_once_with(session_key, "once")
 
     @pytest.mark.asyncio
     async def test_platform_approve_session_marks_session_scope(self):
         runner = _make_runner()
         source = _make_source()
         session_key = runner._session_key_for_source(source)
-        runner._pending_approvals[session_key] = _make_pending_approval()
 
         with (
-            patch("tools.terminal_tool.terminal_tool", return_value="done"),
-            patch("tools.approval.approve_session") as mock_session,
+            patch("tools.approval.has_blocking_approval", return_value=True),
+            patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve,
         ):
             result = await runner._handle_platform_approval_action(session_key, "approve session")
 
         assert "pattern approved for this session" in result
-        mock_session.assert_called_once_with(session_key, "sudo")
+        mock_resolve.assert_called_once_with(session_key, "session")
 
     @pytest.mark.asyncio
     async def test_platform_deny_clears_pending(self):
         runner = _make_runner()
         source = _make_source()
         session_key = runner._session_key_for_source(source)
-        runner._pending_approvals[session_key] = _make_pending_approval()
 
-        result = await runner._handle_platform_approval_action(session_key, "deny")
+        with (
+            patch("tools.approval.has_blocking_approval", return_value=True),
+            patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve,
+        ):
+            result = await runner._handle_platform_approval_action(session_key, "deny")
 
         assert "❌ Command denied" in result
-        assert session_key not in runner._pending_approvals
+        mock_resolve.assert_called_once_with(session_key, "deny")
 
     @pytest.mark.asyncio
     async def test_platform_approval_invalid_action(self):
@@ -393,18 +392,16 @@ class TestPlatformApprovalActions:
         assert "Unsupported approval action" in result
 
     @pytest.mark.asyncio
-    async def test_platform_approval_expired(self):
+    async def test_platform_approval_no_pending(self):
+        """Returns a clear message when no blocked approval exists for the session."""
         runner = _make_runner()
         source = _make_source()
         session_key = runner._session_key_for_source(source)
-        approval = _make_pending_approval()
-        approval["timestamp"] = time.time() - 600
-        runner._pending_approvals[session_key] = approval
 
-        result = await runner._handle_platform_approval_action(session_key, "approve")
+        with patch("tools.approval.has_blocking_approval", return_value=False):
+            result = await runner._handle_platform_approval_action(session_key, "approve")
 
-        assert "expired" in result
-        assert session_key not in runner._pending_approvals
+        assert "No pending command" in result
 
 
 # ------------------------------------------------------------------
