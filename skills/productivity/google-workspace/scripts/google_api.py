@@ -7,8 +7,8 @@ Authenticates using the token stored by setup.py.
 Usage:
   python google_api.py gmail search "is:unread" [--max 10]
   python google_api.py gmail get MESSAGE_ID
-  python google_api.py gmail send --to user@example.com --subject "Hi" --body "Hello"
-  python google_api.py gmail reply MESSAGE_ID --body "Thanks"
+  python google_api.py gmail send --to user@example.com --subject "Hi" --body "Hello" [--html] [--no-signature]
+  python google_api.py gmail reply MESSAGE_ID --body "Thanks" [--html] [--no-signature]
   python google_api.py calendar list [--from DATE] [--to DATE] [--calendar primary]
   python google_api.py calendar create --summary "Meeting" --start DATETIME --end DATETIME
   python google_api.py drive search "budget report" [--max 10]
@@ -36,6 +36,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.settings.basic",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/contacts.readonly",
@@ -166,9 +167,45 @@ def gmail_get(args):
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
+def _get_sendas_primary() -> dict:
+    """Return the primary send-as alias, including displayName and signature HTML.
+
+    The Gmail API does not expose the user's per-address "automatically insert
+    signature" toggle, so callers decide whether to append the signature.
+    Falls back to an empty dict on any error so callers degrade gracefully.
+    """
+    try:
+        service = build_service("gmail", "v1")
+        result = service.users().settings().sendAs().list(userId="me").execute()
+        for alias in result.get("sendAs", []):
+            if alias.get("isPrimary"):
+                return alias
+    except Exception:
+        pass
+    return {}
+
+
+def _build_from_header(alias: dict) -> str:
+    """Build an RFC 2822 From header from a sendAs alias dict."""
+    email = alias.get("sendAsEmail", "")
+    name = alias.get("displayName", "").strip()
+    if name and email:
+        return f'"{name}" <{email}>'
+    return email
+
+
 def gmail_send(args):
-    service = build_service("gmail", "v1")
-    message = MIMEText(args.body, "html" if args.html else "plain")
+    alias = _get_sendas_primary()
+    append_sig = not args.no_signature and bool(alias.get("signature"))
+    is_html = args.html or append_sig
+    body_text = args.body
+    if append_sig:
+        body_text = f"{args.body}<br><br>{alias['signature']}"
+
+    message = MIMEText(body_text, "html" if is_html else "plain")
+    from_header = _build_from_header(alias)
+    if from_header:
+        message["from"] = from_header
     message["to"] = args.to
     message["subject"] = args.subject
     if args.cc:
@@ -180,6 +217,7 @@ def gmail_send(args):
     if args.thread_id:
         body["threadId"] = args.thread_id
 
+    service = build_service("gmail", "v1")
     result = service.users().messages().send(userId="me", body=body).execute()
     print(json.dumps({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")}, indent=2))
 
@@ -197,7 +235,17 @@ def gmail_reply(args):
     if not subject.startswith("Re:"):
         subject = f"Re: {subject}"
 
-    message = MIMEText(args.body)
+    alias = _get_sendas_primary()
+    append_sig = not args.no_signature and bool(alias.get("signature"))
+    is_html = args.html or append_sig
+    body_text = args.body
+    if append_sig:
+        body_text = f"{args.body}<br><br>{alias['signature']}"
+
+    message = MIMEText(body_text, "html" if is_html else "plain")
+    from_header = _build_from_header(alias)
+    if from_header:
+        message["from"] = from_header
     message["to"] = headers.get("From", "")
     message["subject"] = subject
     if headers.get("Message-ID"):
@@ -415,12 +463,15 @@ def main():
     p.add_argument("--body", required=True)
     p.add_argument("--cc", default="")
     p.add_argument("--html", action="store_true", help="Send body as HTML")
+    p.add_argument("--no-signature", action="store_true", help="Do not append the sender's Gmail signature")
     p.add_argument("--thread-id", default="", help="Thread ID for threading")
     p.set_defaults(func=gmail_send)
 
     p = gmail_sub.add_parser("reply")
     p.add_argument("message_id", help="Message ID to reply to")
     p.add_argument("--body", required=True)
+    p.add_argument("--html", action="store_true", help="Send body as HTML")
+    p.add_argument("--no-signature", action="store_true", help="Do not append the sender's Gmail signature")
     p.set_defaults(func=gmail_reply)
 
     p = gmail_sub.add_parser("labels")
