@@ -705,3 +705,86 @@ class TestFallbackNoCallback:
 
         assert result["approved"] is False
         assert result.get("status") == "approval_required"
+
+
+# ------------------------------------------------------------------
+# Regression: "Approve Once" must not grant session-wide approval
+# Fix: NousResearch/hermes-agent#4698
+# ------------------------------------------------------------------
+
+
+class TestApproveOnceScope:
+
+    def setup_method(self):
+        _clear_approval_state()
+
+    def test_approve_once_does_not_grant_session_wide_approval(self):
+        """Approving with 'once' must not add the pattern to the session allowlist.
+
+        Regression test for the bug where choice in ("once", "session") caused
+        approve_session() to be called for both choices, making a one-time
+        approval silently cover all subsequent identical commands in the session.
+        """
+        from tools.approval import (
+            register_gateway_notify,
+            unregister_gateway_notify,
+            resolve_gateway_approval,
+            check_all_command_guards,
+            reset_current_session_key,
+            set_current_session_key,
+        )
+
+        session_key = "once-scope-test"
+        notified = []
+        register_gateway_notify(session_key, lambda d: notified.append(d))
+
+        results = [None, None]
+
+        def run_command(index, command):
+            token = set_current_session_key(session_key)
+            os.environ["HERMES_EXEC_ASK"] = "1"
+            os.environ["HERMES_SESSION_KEY"] = session_key
+            try:
+                results[index] = check_all_command_guards(command, "local")
+            finally:
+                os.environ.pop("HERMES_EXEC_ASK", None)
+                os.environ.pop("HERMES_SESSION_KEY", None)
+                reset_current_session_key(token)
+
+        # First command — run and approve with "once"
+        t1 = threading.Thread(target=run_command, args=(0, "rm -rf /first"))
+        t1.start()
+
+        for _ in range(50):
+            if notified:
+                break
+            time.sleep(0.05)
+
+        assert len(notified) == 1, "First command should have triggered a notification"
+        resolve_gateway_approval(session_key, "once")
+        t1.join(timeout=5)
+
+        assert results[0] is not None
+        assert results[0]["approved"] is True
+
+        # Second command with the same dangerous pattern — must prompt again
+        t2 = threading.Thread(target=run_command, args=(1, "rm -rf /second"))
+        t2.start()
+
+        for _ in range(50):
+            if len(notified) >= 2:
+                break
+            time.sleep(0.05)
+
+        assert len(notified) == 2, (
+            "Second command should have prompted again — 'once' must not grant "
+            "session-wide approval"
+        )
+
+        resolve_gateway_approval(session_key, "once")
+        t2.join(timeout=5)
+
+        assert results[1] is not None
+        assert results[1]["approved"] is True
+
+        unregister_gateway_notify(session_key)
