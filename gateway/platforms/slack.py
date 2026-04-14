@@ -40,6 +40,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
+    classify_document_mime,
     safe_url_for_log,
     cache_document_from_bytes,
 )
@@ -1130,7 +1131,7 @@ class SlackAdapter(BasePlatformAdapter):
                     cached_path = cache_document_from_bytes(
                         raw_bytes, original_filename or f"document{ext}"
                     )
-                    doc_mime = SUPPORTED_DOCUMENT_TYPES[ext]
+                    doc_mime = classify_document_mime(ext, raw_bytes)
                     media_urls.append(cached_path)
                     media_types.append(doc_mime)
                     msg_type = MessageType.DOCUMENT
@@ -1139,6 +1140,18 @@ class SlackAdapter(BasePlatformAdapter):
                     # Inject text content for .txt/.md files (capped at 100 KB)
                     MAX_TEXT_INJECT_BYTES = 100 * 1024
                     if ext in (".md", ".txt") and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                        try:
+                            text_content = raw_bytes.decode("utf-8")
+                            display_name = original_filename or f"document{ext}"
+                            display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                            injection = f"[Content of {display_name}]:\n{text_content}"
+                            if text:
+                                text = f"{injection}\n\n{text}"
+                            else:
+                                text = injection
+                        except UnicodeDecodeError:
+                            pass  # Binary content, skip injection
+                    elif ext == ".skill" and doc_mime == "text/markdown" and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                         try:
                             text_content = raw_bytes.decode("utf-8")
                             display_name = original_filename or f"document{ext}"

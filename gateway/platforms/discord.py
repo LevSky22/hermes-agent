@@ -53,6 +53,7 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_url,
     cache_document_from_bytes,
+    classify_document_mime,
     SUPPORTED_DOCUMENT_TYPES,
 )
 from tools.url_safety import is_safe_url
@@ -2437,13 +2438,25 @@ class DiscordAdapter(BasePlatformAdapter):
                             cached_path = cache_document_from_bytes(
                                 raw_bytes, att.filename or f"document{ext}"
                             )
-                            doc_mime = SUPPORTED_DOCUMENT_TYPES[ext]
+                            doc_mime = classify_document_mime(ext, raw_bytes)
                             media_urls.append(cached_path)
                             media_types.append(doc_mime)
                             logger.info("[Discord] Cached user document: %s", cached_path)
                             # Inject text content for plain-text documents (capped at 100 KB)
                             MAX_TEXT_INJECT_BYTES = 100 * 1024
                             if ext in (".md", ".txt", ".log") and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                                try:
+                                    text_content = raw_bytes.decode("utf-8")
+                                    display_name = att.filename or f"document{ext}"
+                                    display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                                    injection = f"[Content of {display_name}]:\n{text_content}"
+                                    if pending_text_injection:
+                                        pending_text_injection = f"{pending_text_injection}\n\n{injection}"
+                                    else:
+                                        pending_text_injection = injection
+                                except UnicodeDecodeError:
+                                    pass
+                            elif ext == ".skill" and doc_mime == "text/markdown" and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                                 try:
                                     text_content = raw_bytes.decode("utf-8")
                                     display_name = att.filename or f"document{ext}"

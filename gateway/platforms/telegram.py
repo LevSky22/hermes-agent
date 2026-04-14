@@ -65,6 +65,7 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
     cache_audio_from_bytes,
     cache_document_from_bytes,
+    classify_document_mime,
     resolve_proxy_url,
     SUPPORTED_DOCUMENT_TYPES,
     utf16_len,
@@ -2461,7 +2462,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 doc_bytes = await file_obj.download_as_bytearray()
                 raw_bytes = bytes(doc_bytes)
                 cached_path = cache_document_from_bytes(raw_bytes, original_filename or f"document{ext}")
-                mime_type = SUPPORTED_DOCUMENT_TYPES[ext]
+                mime_type = classify_document_mime(ext, raw_bytes)
                 event.media_urls = [cached_path]
                 event.media_types = [mime_type]
                 logger.info("[Telegram] Cached user document at %s", cached_path)
@@ -2469,6 +2470,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 # For text files, inject content into event.text (capped at 100 KB)
                 MAX_TEXT_INJECT_BYTES = 100 * 1024
                 if ext in (".md", ".txt") and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                    try:
+                        text_content = raw_bytes.decode("utf-8")
+                        display_name = original_filename or f"document{ext}"
+                        display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                        injection = f"[Content of {display_name}]:\n{text_content}"
+                        if event.text:
+                            event.text = f"{injection}\n\n{event.text}"
+                        else:
+                            event.text = injection
+                    except UnicodeDecodeError:
+                        logger.warning(
+                            "[Telegram] Could not decode text file as UTF-8, skipping content injection",
+                            exc_info=True,
+                        )
+                elif ext == ".skill" and mime_type == "text/markdown" and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                     try:
                         text_content = raw_bytes.decode("utf-8")
                         display_name = original_filename or f"document{ext}"

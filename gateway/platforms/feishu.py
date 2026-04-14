@@ -2687,8 +2687,12 @@ class FeishuAdapter(BasePlatformAdapter):
             if os.path.getsize(cached_path) > _MAX_TEXT_INJECT_BYTES:
                 return ""
             ext = Path(cached_path).suffix.lower()
-            if ext not in {".txt", ".md"} and media_type not in {"text/plain", "text/markdown"}:
+            if ext not in {".txt", ".md", ".skill"} and media_type not in {"text/plain", "text/markdown"}:
                 return ""
+            if ext == ".skill":
+                with open(cached_path, "rb") as f:
+                    if f.read(4).startswith(b"PK"):
+                        return ""
             content = Path(cached_path).read_text(encoding="utf-8")
             display_name = self._display_name_from_cached_path(cached_path)
             return f"[Content of {display_name}]:\n{content}"

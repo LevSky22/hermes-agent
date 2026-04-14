@@ -13,6 +13,7 @@ import pytest
 
 from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
+    classify_document_mime,
     cache_document_from_bytes,
     cleanup_document_cache,
     get_document_cache_dir,
@@ -151,7 +152,13 @@ class TestSupportedDocumentTypes:
 
     @pytest.mark.parametrize(
         "ext",
-        [".pdf", ".md", ".txt", ".zip", ".docx", ".xlsx", ".pptx"],
+        [".pdf", ".md", ".skill", ".txt", ".zip", ".docx", ".xlsx", ".pptx"],
     )
     def test_expected_extensions_present(self, ext):
         assert ext in SUPPORTED_DOCUMENT_TYPES
+
+    def test_skill_zip_payload_detected_as_zip(self):
+        assert classify_document_mime(".skill", b"PK\x03\x04bundle") == "application/zip"
+
+    def test_skill_text_payload_detected_as_markdown(self):
+        assert classify_document_mime(".skill", b"---\nname: demo\n---\nbody") == "text/markdown"

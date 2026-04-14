@@ -563,6 +563,7 @@ DOCUMENT_CACHE_DIR = get_hermes_dir("cache/documents", "document_cache")
 SUPPORTED_DOCUMENT_TYPES = {
     ".pdf": "application/pdf",
     ".md": "text/markdown",
+    ".skill": "application/octet-stream",
     ".txt": "text/plain",
     ".log": "text/plain",
     ".zip": "application/zip",
@@ -570,6 +571,24 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
+
+
+def classify_document_mime(ext: str, data: bytes) -> str:
+    """Return the effective MIME type for a document payload.
+
+    `.skill` can be either plaintext markdown or a ZIP bundle depending on the
+    producer, so inspect the bytes instead of trusting the extension alone.
+    """
+    mime_type = SUPPORTED_DOCUMENT_TYPES[ext]
+    if ext != ".skill":
+        return mime_type
+    if data.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+        return "application/zip"
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return mime_type
+    return "text/markdown"
 
 
 def get_document_cache_dir() -> Path:

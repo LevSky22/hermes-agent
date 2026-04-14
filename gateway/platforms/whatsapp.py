@@ -952,12 +952,16 @@ class WhatsAppAdapter(BasePlatformAdapter):
             if msg_type == MessageType.DOCUMENT and cached_urls:
                 for doc_path in cached_urls:
                     ext = Path(doc_path).suffix.lower()
-                    if ext in (".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml", ".log", ".py", ".js", ".ts", ".html", ".css"):
+                    if ext in (".txt", ".md", ".skill", ".csv", ".json", ".xml", ".yaml", ".yml", ".log", ".py", ".js", ".ts", ".html", ".css"):
                         try:
                             file_size = Path(doc_path).stat().st_size
                             if file_size > MAX_TEXT_INJECT_BYTES:
                                 print(f"[{self.name}] Skipping text injection for {doc_path} ({file_size} bytes > {MAX_TEXT_INJECT_BYTES})", flush=True)
                                 continue
+                            if ext == ".skill":
+                                with open(doc_path, "rb") as f:
+                                    if f.read(4).startswith(b"PK"):
+                                        continue
                             content = Path(doc_path).read_text(errors="replace")
                             fname = Path(doc_path).name
                             # Remove the doc_<hex>_ prefix for display
