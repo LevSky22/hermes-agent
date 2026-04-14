@@ -2987,8 +2987,16 @@ def gateway_command(args):
         elif is_macos() and get_launchd_plist_path().exists():
             launchd_status(deep)
         else:
-            # Check for manually running processes
-            pids = find_gateway_pids()
+            # For manual/foreground runs, prefer the PID-file helper first.
+            # It is more robust in containers where `ps`-based discovery can
+            # fail or omit the foreground gateway process.
+            try:
+                from gateway.status import get_running_pid
+            except Exception:
+                get_running_pid = None
+
+            running_pid = get_running_pid() if get_running_pid is not None else None
+            pids = [running_pid] if running_pid is not None else find_gateway_pids()
             if pids:
                 print(f"✓ Gateway is running (PID: {', '.join(map(str, pids))})")
                 print("  (Running manually, not as a system service)")

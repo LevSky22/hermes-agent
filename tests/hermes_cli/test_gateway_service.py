@@ -547,6 +547,26 @@ class TestGatewaySystemServiceRouting:
         assert "nohup hermes gateway" in out
         assert "install as user service" not in out
 
+    def test_gateway_status_prefers_pid_file_helper_for_manual_gateway(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 1)
+        monkeypatch.setattr(
+            gateway_cli,
+            "find_gateway_pids",
+            lambda exclude_pids=None, all_profiles=False: (_ for _ in ()).throw(
+                AssertionError("find_gateway_pids should not be used when PID-file detection succeeds")
+            ),
+        )
+        monkeypatch.setattr(gateway_cli, "_runtime_health_lines", lambda: [])
+
+        gateway_cli.gateway_command(SimpleNamespace(gateway_command="status", deep=False, system=False))
+
+        out = capsys.readouterr().out
+        assert "Gateway is running (PID: 1)" in out
+        assert "Running manually, not as a system service" in out
+
     def test_gateway_restart_does_not_fallback_to_foreground_when_launchd_restart_fails(self, tmp_path, monkeypatch):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("plist\n", encoding="utf-8")
