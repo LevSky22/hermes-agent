@@ -144,7 +144,7 @@ ENV npm_config_install_links=false
 
 RUN npm install --prefer-offline --no-audit && \
     npx playwright install --with-deps chromium --only-shell && \
-    npm install -g @googleworkspace/cli@0.22.5 @z_ai/mcp-server@latest @chykalophia/clickup-mcp-server @xdevplatform/xurl n8n-mcp@2.63.2 && \
+    npm install -g @anthropic-ai/claude-code@2.1.207 @googleworkspace/cli@0.22.5 @z_ai/mcp-server@latest @chykalophia/clickup-mcp-server @xdevplatform/xurl n8n-mcp@2.63.2 && \
     npm cache clean --force
 
 # ---------- Layer-cached Python dependency install ----------
