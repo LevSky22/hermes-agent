@@ -35,7 +35,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # hermes process, the dashboard, and per-profile gateways.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    build-essential ca-certificates curl docker-cli ffmpeg gcc g++ ghostscript git iputils-ping jq libffi-dev libolm-dev libtesseract-dev make cmake openssh-client pandoc poppler-utils procps python3 python-is-python3 python3-dev python3-venv qpdf ripgrep tesseract-ocr tesseract-ocr-fra wget xz-utils && \
+    build-essential ca-certificates curl docker-cli ffmpeg file gcc g++ ghostscript git iputils-ping jq libffi-dev libolm-dev libtesseract-dev make cmake openssh-client pandoc poppler-utils procps python3 python-is-python3 python3-dev python3-venv qpdf ripgrep tesseract-ocr tesseract-ocr-fra wget xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
 # ---------- s6-overlay install ----------
