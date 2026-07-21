@@ -289,6 +289,7 @@ async def test_discord_free_response_channel_skips_auto_thread(adapter, monkeypa
     """
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.delenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", raising=False)
     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)  # default true
 
     adapter._auto_create_thread = AsyncMock()
@@ -305,6 +306,143 @@ async def test_discord_free_response_channel_skips_auto_thread(adapter, monkeypa
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "casual chat in free-response channel"
     assert event.source.chat_type == "group"
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_free_response_channel_auto_threads_without_mention(adapter, monkeypatch):
+    """Thread-free-response channels bypass mention gating but keep auto-threading."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    fake_thread = FakeThread(channel_id=999, name="auto-thread")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789),
+        content="ambient intake request",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "ambient intake request"
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "999"
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_free_response_wildcard_auto_threads_without_mention(adapter, monkeypatch):
+    """The threaded free-response list supports the same wildcard convention."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", "*")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    fake_thread = FakeThread(channel_id=999, name="auto-thread")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    message = make_message(channel=FakeTextChannel(channel_id=789), content="hello")
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+
+
+
+
+@pytest.mark.asyncio
+async def test_discord_voice_linked_parent_thread_still_requires_mention(adapter, monkeypatch):
+    """Threads under a voice-linked channel should still require @mention."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    adapter._voice_text_channels[111] = 789
+    message = make_message(
+        channel=FakeThread(channel_id=790, parent=FakeTextChannel(channel_id=789)),
+        content="thread reply without mention",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_default_keeps_responding_after_participation(adapter, monkeypatch):
+    """Default behavior: once the bot is in a thread, it auto-responds without @mention."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_THREAD_REQUIRE_MENTION", raising=False)
+
+    thread = FakeThread(channel_id=456, name="follow-up")
+    adapter._threads.mark("456")  # bot has previously participated
+
+    message = make_message(channel=thread, content="follow-up without mention")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_require_mention_gates_followups(adapter, monkeypatch):
+    """When thread_require_mention=true, even bot-participated threads need @mention."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    thread = FakeThread(channel_id=456, name="multi-bot thread")
+    adapter._threads.mark("456")  # bot has previously participated
+
+    message = make_message(channel=thread, content="ambient chatter — not for me")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_require_mention_still_responds_when_mentioned(adapter, monkeypatch):
+    """thread_require_mention=true still lets explicit @mentions through in threads."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    thread = FakeThread(channel_id=456, name="multi-bot thread")
+    adapter._threads.mark("456")
+    bot_user = adapter._client.user
+
+    message = make_message(
+        channel=thread,
+        content=f"<@{bot_user.id}> hey, this one's for you",
+        mentions=[bot_user],
+    )
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_require_mention_via_config_extra(adapter, monkeypatch):
+    """thread_require_mention can also be set via config.extra (yaml)."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_THREAD_REQUIRE_MENTION", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    adapter.config.extra["thread_require_mention"] = True
+
+    thread = FakeThread(channel_id=456, name="multi-bot thread")
+    adapter._threads.mark("456")
+
+    message = make_message(channel=thread, content="ambient — should be ignored")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
 
 
 @pytest.mark.asyncio
@@ -827,3 +965,23 @@ async def test_discord_reply_in_free_channel_triggers_backfill(adapter, monkeypa
     )
 
 
+@pytest.mark.asyncio
+async def test_discord_non_reply_free_channel_skips_backfill(adapter, monkeypatch):
+    """A plain (non-reply) message in a free-response channel still skips backfill.
+
+    Guards against the reply gate accidentally widening to every free-channel
+    message — only replies (and the existing mention-gap / thread cases) should
+    hydrate context.
+    """
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    adapter.config.extra["history_backfill"] = True
+    adapter._fetch_channel_context = AsyncMock(return_value="[Recent channel messages]\n[Alice] noise")
+
+    message = make_message(channel=FakeTextChannel(channel_id=321), content="just chatting")
+    assert message.reference is None  # not a reply
+
+    await adapter._handle_message(message)
+
+    adapter._fetch_channel_context.assert_not_awaited()
