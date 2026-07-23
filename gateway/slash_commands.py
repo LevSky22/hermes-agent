@@ -2648,6 +2648,9 @@ class GatewaySlashCommandsMixin:
                 self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
             return t("gateway.voice.enabled_voice_only")
         elif args in {"off", "disable"}:
+            guild_id = self._get_guild_id(event)
+            if guild_id and adapter and hasattr(adapter, "stop_realtime_voice"):
+                await adapter.stop_realtime_voice(guild_id)
             self._voice_mode[voice_key] = "off"
             self._save_voice_modes()
             if adapter:

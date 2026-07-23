@@ -2615,6 +2615,8 @@ DEFAULT_CONFIG = {
             "vad_threshold": 0.7,
             "vad_prefix_ms": 300,
             "vad_silence_ms": 700,
+            "input_silence_threshold": 120,
+            "manual_turn_timeout_ms": 700,
             "max_active_tasks": 2,
             "max_queued_tasks": 5,
             "api_server_url": "http://127.0.0.1:8642",

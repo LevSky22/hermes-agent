@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import time
 from collections import deque
 from typing import Any, Awaitable, Callable, Optional
 
@@ -57,6 +58,19 @@ def pcm_24k_mono_to_48k_stereo(pcm: bytes) -> bytes:
     return stereo.tobytes()
 
 
+def pcm_rms(pcm: bytes) -> float:
+    """Return RMS amplitude for little-endian signed 16-bit PCM."""
+    if not pcm:
+        return 0.0
+    import numpy as np
+
+    samples = np.frombuffer(pcm[: len(pcm) - (len(pcm) % 2)], dtype="<i2")
+    if not samples.size:
+        return 0.0
+    values = samples.astype(np.float64)
+    return float(np.sqrt(np.mean(values * values)))
+
+
 class DiscordRealtimeSession:
     """One bounded, reconnecting Realtime session for a Discord guild."""
 
@@ -74,6 +88,8 @@ class DiscordRealtimeSession:
         vad_threshold: float = 0.7,
         vad_prefix_ms: int = 300,
         vad_silence_ms: int = 700,
+        input_silence_threshold: int = 120,
+        manual_turn_timeout_ms: int = 700,
         instructions: str = DEFAULT_INSTRUCTIONS,
         history_turns: int = 50,
         session_rotation_seconds: int = 3000,
@@ -91,6 +107,8 @@ class DiscordRealtimeSession:
         self.vad_threshold = max(0.0, min(1.0, float(vad_threshold)))
         self.vad_prefix_ms = max(0, int(vad_prefix_ms))
         self.vad_silence_ms = max(100, int(vad_silence_ms))
+        self.input_silence_threshold = max(0, int(input_silence_threshold))
+        self.manual_turn_timeout_ms = max(100, int(manual_turn_timeout_ms))
         self.instructions = instructions
         self.history_turns = max(4, int(history_turns))
         self.session_rotation_seconds = max(300, int(session_rotation_seconds))
@@ -107,6 +125,12 @@ class DiscordRealtimeSession:
         self._connected = asyncio.Event()
         self._active_response = False
         self._handled_call_ids: set[str] = set()
+        self._turn_timer: Optional[asyncio.TimerHandle] = None
+        self._turn_has_audio = False
+        self._last_input_audio_at = 0.0
+        self._sent_audio_chunks = 0
+        self._received_audio_chunks = 0
+        self._session_updated_logged = False
         self.last_error: Optional[str] = None
 
     @property
@@ -135,6 +159,7 @@ class DiscordRealtimeSession:
     async def stop(self, *, close_broker: bool = False) -> None:
         self._stopping = True
         self._connected.clear()
+        self._cancel_turn_timer()
         tasks = [task for task in (self._sender, self._runner) if task is not None]
         for task in tasks:
             task.cancel()
@@ -153,6 +178,8 @@ class DiscordRealtimeSession:
 
     def pause(self) -> None:
         self._paused = True
+        self._cancel_turn_timer()
+        self._turn_has_audio = False
         self._clear_input()
 
     def resume(self) -> None:
@@ -165,6 +192,9 @@ class DiscordRealtimeSession:
         converted = pcm_48k_stereo_to_24k_mono(pcm)
         if not converted:
             return True
+        rms = pcm_rms(converted)
+        if rms < self.input_silence_threshold:
+            return True
         self._loop.call_soon_threadsafe(self._enqueue_input, converted)
         return True
 
@@ -174,6 +204,13 @@ class DiscordRealtimeSession:
         self._active_response = False
 
     def _enqueue_input(self, pcm: bytes) -> None:
+        self._sent_audio_chunks += 1
+        if self._sent_audio_chunks <= 3 or self._sent_audio_chunks in {10, 25, 50, 100}:
+            logger.info(
+                "Discord Realtime input chunk #%d: bytes=%d",
+                self._sent_audio_chunks,
+                len(pcm),
+            )
         if self._input.full():
             try:
                 self._input.get_nowait()
@@ -183,6 +220,50 @@ class DiscordRealtimeSession:
             self._input.put_nowait(pcm)
         except asyncio.QueueFull:
             pass
+        self._turn_has_audio = True
+        self._last_input_audio_at = time.monotonic()
+        self._schedule_turn_finalize()
+
+    def _schedule_turn_finalize(self) -> None:
+        self._cancel_turn_timer()
+        if self._loop is None or self._loop.is_closed():
+            return
+        self._turn_timer = self._loop.call_later(
+            self.manual_turn_timeout_ms / 1000.0,
+            self._turn_timeout_fired,
+        )
+
+    def _cancel_turn_timer(self) -> None:
+        timer = self._turn_timer
+        self._turn_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _turn_timeout_fired(self) -> None:
+        self._turn_timer = None
+        if self._loop is None or self._loop.is_closed():
+            return
+        self._loop.create_task(self._finalize_input_turn())
+
+    async def _finalize_input_turn(self) -> None:
+        if self._stopping or self._paused or not self._turn_has_audio or self._ws is None:
+            return
+        elapsed_ms = (time.monotonic() - self._last_input_audio_at) * 1000
+        if elapsed_ms < self.manual_turn_timeout_ms:
+            self._schedule_turn_finalize()
+            return
+        # A provider-created response means server VAD already finalized this
+        # turn. Avoid a duplicate commit/response in that case.
+        if self._active_response:
+            self._turn_has_audio = False
+            return
+        self._turn_has_audio = False
+        logger.info(
+            "Discord Realtime finalizing input turn after %dms silence",
+            self.manual_turn_timeout_ms,
+        )
+        await self._send({"type": "input_audio_buffer.commit"})
+        await self._send({"type": "response.create"})
 
     def _clear_input(self) -> None:
         while True:
@@ -338,8 +419,27 @@ class DiscordRealtimeSession:
         kind = str(event.get("type") or "")
         if kind == "input_audio_buffer.speech_started":
             self._active_response = False
+            logger.info("Discord Realtime VAD event: %s", kind)
             if self.text_callback:
                 await self.text_callback("barge_in", "")
+            return
+        if kind == "input_audio_buffer.speech_stopped":
+            logger.info("Discord Realtime VAD event: %s", kind)
+            return
+        if kind == "session.updated":
+            if not self._session_updated_logged:
+                self._session_updated_logged = True
+                logger.info(
+                    "Discord Realtime session updated: model=%s voice=%s",
+                    self.model,
+                    self.voice,
+                )
+            return
+        if kind in {"response.created", "response.output_item.added"}:
+            self._active_response = True
+            self._turn_has_audio = False
+            self._cancel_turn_timer()
+            logger.info("Discord Realtime response event: %s", kind)
             return
         if kind == "conversation.item.input_audio_transcription.completed":
             text = str(event.get("transcript") or "").strip()
@@ -358,6 +458,13 @@ class DiscordRealtimeSession:
                 except (ValueError, TypeError):
                     pcm = b""
                 if pcm:
+                    self._received_audio_chunks += 1
+                    if self._received_audio_chunks <= 3 or self._received_audio_chunks in {10, 25, 50, 100}:
+                        logger.info(
+                            "Discord Realtime output chunk #%d: bytes=%d",
+                            self._received_audio_chunks,
+                            len(pcm),
+                        )
                     self.audio_callback(pcm_24k_mono_to_48k_stereo(pcm))
             return
         if kind in {

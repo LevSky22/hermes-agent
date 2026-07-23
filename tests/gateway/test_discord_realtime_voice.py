@@ -10,6 +10,7 @@ from plugins.platforms.discord.realtime_voice import (
     DiscordRealtimeSession,
     pcm_24k_mono_to_48k_stereo,
     pcm_48k_stereo_to_24k_mono,
+    pcm_rms,
 )
 from plugins.platforms.discord.voice_mixer import FRAME_SIZE, VoiceMixer
 
@@ -31,6 +32,35 @@ def test_pcm_conversion_preserves_duration_and_channels():
     assert len(realtime_pcm) == 240 * 2
     round_trip = pcm_24k_mono_to_48k_stereo(realtime_pcm)
     assert len(round_trip) == 480 * 2 * 2
+
+
+def test_pcm_rms_distinguishes_silence_and_speech():
+    np = pytest.importorskip("numpy")
+    assert pcm_rms(b"\x00\x00" * 240) == 0
+    assert pcm_rms(np.full(240, 1000, dtype=np.int16).tobytes()) == 1000
+
+
+@pytest.mark.asyncio
+async def test_realtime_filters_silence_and_manually_finalizes_turn():
+    np = pytest.importorskip("numpy")
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+        manual_turn_timeout_ms=100,
+    )
+    session._loop = asyncio.get_running_loop()
+    session._ws = AsyncMock()
+    session.feed_discord_pcm(1, b"\x00\x00" * 960)
+    await asyncio.sleep(0)
+    assert session._input.empty()
+
+    speech = np.full(960, 1000, dtype=np.int16).tobytes()
+    session.feed_discord_pcm(1, speech)
+    await asyncio.sleep(0.14)
+    sent = [json.loads(call.args[0]) for call in session._ws.send.await_args_list]
+    assert {"type": "input_audio_buffer.commit"} in sent
+    assert {"type": "response.create"} in sent
 
 
 def test_voice_mixer_stream_is_bounded_and_clears_on_overrun():

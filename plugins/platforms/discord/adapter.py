@@ -3975,6 +3975,8 @@ class DiscordAdapter(BasePlatformAdapter):
             vad_threshold=float(cfg.get("vad_threshold", 0.7)),
             vad_prefix_ms=int(cfg.get("vad_prefix_ms", 300)),
             vad_silence_ms=int(cfg.get("vad_silence_ms", 700)),
+            input_silence_threshold=int(cfg.get("input_silence_threshold", 120)),
+            manual_turn_timeout_ms=int(cfg.get("manual_turn_timeout_ms", 700)),
         )
         session_ref["session"] = session
         await session.start()
