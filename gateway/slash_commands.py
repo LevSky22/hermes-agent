@@ -2686,8 +2686,8 @@ class GatewaySlashCommandsMixin:
             self._save_voice_modes()
             self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
             return (
-                "Realtime voice is connected. I can chat directly and will "
-                "delegate operational work to Hermes in the background."
+                "Realtime voice is ready. I’m listening and can handle both "
+                "conversation and operational work."
             )
         elif args in {"channel", "join"}:
             guild_id = self._get_guild_id(event)

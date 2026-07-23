@@ -57,9 +57,10 @@ task IDs, or other implementation details.
 # Durable learning
 - Treat explicit requests to remember something, adopt an always/never preference,
   change durable identity, or learn a reusable process as consequential work.
-- Send the exact request through delegate_to_hermes and ask the primary runtime to
-  persist it appropriately: USER memory for user preferences, MEMORY for durable
-  facts, SOUL for identity changes, or a local skill for reusable procedures.
+- For an explicit user preference or correction, call remember_user_preference.
+- For durable facts, identity changes, and reusable procedures, send the exact
+  request through delegate_to_hermes and ask the primary runtime to persist it
+  appropriately in MEMORY, SOUL, or a local skill.
 - Follow the requested correction immediately in this conversation, but do not say
   it was saved until a successful work update confirms persistence.
 
@@ -525,8 +526,7 @@ class DiscordRealtimeSession:
             self._ws = ws
             await self._send(self._session_update())
             await self._seed_history()
-            self._connected.set()
-            self.last_error = None
+            await self._wait_until_session_updated(ws)
             self._sender = asyncio.create_task(self._send_audio())
             await self._flush_task_announcements()
             try:
@@ -548,6 +548,24 @@ class DiscordRealtimeSession:
                     await asyncio.gather(self._sender, return_exceptions=True)
                     self._sender = None
                 self._ws = None
+
+    async def _wait_until_session_updated(self, ws: Any) -> None:
+        """Wait until OpenAI has applied the configured audio session.
+
+        A completed WebSocket handshake is not sufficient readiness: the server
+        confirms the effective PCM/VAD configuration with ``session.updated``.
+        Discord audio may already be buffered by the receiver while we wait.
+        """
+        async with asyncio.timeout(15):
+            while not self._connected.is_set():
+                raw = await ws.recv()
+                event = json.loads(raw)
+                await self._handle_event(event)
+                if event.get("type") == "error":
+                    raise RuntimeError(
+                        self.last_error or "Realtime session setup failed"
+                    )
+        self.last_error = None
 
     def _session_update(self) -> dict[str, Any]:
         if self.vad_type == "semantic_vad":
@@ -691,6 +709,7 @@ class DiscordRealtimeSession:
             logger.info("Discord Realtime VAD event: %s", kind)
             return
         if kind == "session.updated":
+            self._connected.set()
             if not self._session_updated_logged:
                 self._session_updated_logged = True
                 logger.info(

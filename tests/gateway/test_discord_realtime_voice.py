@@ -27,12 +27,32 @@ from plugins.platforms.discord.voice_mixer import (
 def test_realtime_exposes_only_narrow_bridge_tools():
     assert [tool["name"] for tool in REALTIME_TOOLS] == [
         "delegate_to_hermes",
+        "remember_user_preference",
         "get_hermes_task_status",
         "send_followup_to_hermes",
         "cancel_hermes_task",
         "approve_hermes_action",
         "wait_for_user",
     ]
+
+
+@pytest.mark.asyncio
+async def test_realtime_becomes_ready_only_after_session_updated():
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+    )
+    ws = AsyncMock()
+    ws.recv.side_effect = [
+        json.dumps({"type": "session.created"}),
+        json.dumps({"type": "session.updated", "session": {}}),
+    ]
+
+    assert not session.connected
+    await session._wait_until_session_updated(ws)
+    assert session.connected
+    assert ws.recv.await_count == 2
 
 
 def test_pcm_conversion_preserves_duration_and_channels():
@@ -529,7 +549,7 @@ async def test_broker_emits_sanitized_progress_update(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_broker_status_check_suppresses_next_progress_heartbeat(tmp_path):
+async def test_broker_status_check_does_not_delay_scheduled_progress(tmp_path):
     callback = AsyncMock()
     broker = HermesRunBroker(
         owner_key="owner",
@@ -560,7 +580,33 @@ async def test_broker_status_check_suppresses_next_progress_heartbeat(tmp_path):
         await broker.close()
 
     assert result["status"] == "running"
-    callback.assert_not_awaited()
+    callback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_broker_routes_user_preference_to_durable_user_memory(tmp_path):
+    broker = HermesRunBroker(
+        owner_key="owner",
+        api_key="key",
+        store_path=tmp_path / "preference.sqlite3",
+    )
+    broker.delegate = AsyncMock(
+        return_value={"ok": True, "task_id": "rtask_pref", "status": "queued"}
+    )
+    try:
+        result = await broker.handle_tool(
+            "remember_user_preference",
+            {"preference": "Do not read URLs aloud in voice conversations."},
+            "call_pref",
+        )
+    finally:
+        await broker.close()
+
+    assert result["ok"] is True
+    request = broker.delegate.await_args.args[0]
+    assert "USER memory" in request
+    assert "Do not read URLs aloud in voice conversations." in request
+    assert "Do not modify SOUL.md or any skill" in request
 
 
 @pytest.mark.asyncio

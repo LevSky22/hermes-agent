@@ -4007,7 +4007,6 @@ class DiscordAdapter(BasePlatformAdapter):
             identity_context=load_realtime_identity_context(),
         )
         session_ref["session"] = session
-        await session.start()
 
         def _pcm_callback(frame_user_id: int, pcm: bytes) -> bool:
             if frame_user_id == user_id:
@@ -4021,7 +4020,15 @@ class DiscordAdapter(BasePlatformAdapter):
             # another participant into classic STT while it is active.
             return True
 
+        # Attach the receiver before the OpenAI handshake so speech beginning
+        # while /voice realtime is starting is buffered instead of discarded.
         receiver.set_pcm_callback(_pcm_callback)
+        try:
+            await session.start()
+        except Exception:
+            receiver.set_pcm_callback(None)
+            await session.stop()
+            raise
         self._realtime_voice_sessions[guild_id] = session
         logger.info("Discord Realtime voice enabled (guild=%s user=%s)", guild_id, user_id)
 
