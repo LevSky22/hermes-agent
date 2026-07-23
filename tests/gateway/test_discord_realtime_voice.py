@@ -10,6 +10,7 @@ from plugins.platforms.discord.adapter import DiscordAdapter
 from plugins.platforms.discord.realtime_broker import HermesRunBroker, REALTIME_TOOLS
 from plugins.platforms.discord.realtime_voice import (
     DiscordRealtimeSession,
+    load_realtime_identity_context,
     pcm_24k_mono_to_48k_stereo,
     pcm_48k_stereo_to_24k_mono,
     pcm_rms,
@@ -173,6 +174,33 @@ def test_realtime_session_payload_supports_semantic_vad():
     }
 
 
+def test_realtime_identity_uses_canonical_soul_and_memory(monkeypatch):
+    store = MagicMock()
+    store.format_for_system_prompt.side_effect = lambda target: {
+        "memory": "MEMORY (your personal notes)\nUses ClickUp.",
+        "user": "USER PROFILE (who the user is)\nPrefers spoken answers.",
+    }[target]
+    monkeypatch.setattr("agent.prompt_builder.load_soul_md", lambda: "You are Léo.")
+    monkeypatch.setattr("tools.memory_tool.load_on_disk_store", lambda: store)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"memory": {"memory_enabled": True, "user_profile_enabled": True}},
+    )
+
+    context = load_realtime_identity_context()
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+        identity_context=context,
+    )
+
+    assert "# Canonical identity (SOUL.md)\n\nYou are Léo." in session.instructions
+    assert "Uses ClickUp." in session.instructions
+    assert "Prefers spoken answers." in session.instructions
+    assert "never mention Hermes" in session.instructions
+
+
 @pytest.mark.asyncio
 async def test_realtime_function_call_uses_broker_and_returns_output():
     broker = MagicMock()
@@ -196,6 +224,66 @@ async def test_realtime_function_call_uses_broker_and_returns_output():
     )
     sent = [json.loads(call.args[0]) for call in session._ws.send.await_args_list]
     assert sent[0]["item"]["type"] == "function_call_output"
+    assert sent[1] == {"type": "response.create"}
+
+
+@pytest.mark.asyncio
+async def test_completed_task_is_announced_once_when_idle():
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+    )
+    session._ws = AsyncMock()
+    task = {"task_id": "rtask_12345678", "status": "completed", "output": "Email sent."}
+
+    await session.notify_task_status(task)
+    await session.notify_task_status(task)
+
+    sent = [json.loads(call.args[0]) for call in session._ws.send.await_args_list]
+    assert len(sent) == 2
+    assert sent[0]["type"] == "conversation.item.create"
+    assert "Email sent." in sent[0]["item"]["content"][0]["text"]
+    assert sent[1] == {"type": "response.create"}
+
+
+@pytest.mark.asyncio
+async def test_running_task_is_not_announced():
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+    )
+    session._ws = AsyncMock()
+
+    await session.notify_task_status({"task_id": "rtask_1", "status": "running"})
+
+    session._ws.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_task_announcement_waits_for_active_response():
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+    )
+    session._ws = AsyncMock()
+    session._active_response = True
+
+    await session.notify_task_status({
+        "task_id": "rtask_87654321",
+        "status": "waiting_for_approval",
+        "approval_id": "approval_1",
+        "approval": {"description": "Send the email"},
+    })
+    session._ws.send.assert_not_awaited()
+
+    await session._handle_event({"type": "response.done", "response": {"output": []}})
+
+    sent = [json.loads(call.args[0]) for call in session._ws.send.await_args_list]
+    assert len(sent) == 2
+    assert "needs approval" in sent[0]["item"]["content"][0]["text"]
     assert sent[1] == {"type": "response.create"}
 
 

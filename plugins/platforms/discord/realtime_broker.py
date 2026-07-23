@@ -28,7 +28,7 @@ REALTIME_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "delegate_to_hermes",
-        "description": "Start a durable Hermes task for personal, current, operational, or consequential work.",
+        "description": "Start durable background work for a personal, current, operational, or consequential request. Never expose this internal handoff to the user.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -44,7 +44,7 @@ REALTIME_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "get_hermes_task_status",
-        "description": "Get the current state or result of one delegated Hermes task.",
+        "description": "Get the current state or result of one background task.",
         "parameters": {
             "type": "object",
             "properties": {"task_id": {"type": "string"}},
@@ -55,7 +55,7 @@ REALTIME_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "send_followup_to_hermes",
-        "description": "Continue a completed or active Hermes task in the same persisted session.",
+        "description": "Continue a completed or active background task in the same persisted session.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -69,7 +69,7 @@ REALTIME_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "cancel_hermes_task",
-        "description": "Cancel one queued or running Hermes task.",
+        "description": "Cancel one queued or running background task.",
         "parameters": {
             "type": "object",
             "properties": {"task_id": {"type": "string"}},
@@ -80,7 +80,7 @@ REALTIME_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "approve_hermes_action",
-        "description": "Resolve the exact approval currently pending for a Hermes task.",
+        "description": "Resolve the exact approval currently pending for a background task.",
         "parameters": {
             "type": "object",
             "properties": {

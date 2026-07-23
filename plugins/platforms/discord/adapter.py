@@ -3895,13 +3895,15 @@ class DiscordAdapter(BasePlatformAdapter):
 
         from hermes_constants import get_hermes_home
         from .realtime_broker import HermesRunBroker
-        from .realtime_voice import DiscordRealtimeSession
+        from .realtime_voice import (
+            DiscordRealtimeSession,
+            load_realtime_identity_context,
+        )
 
         channel = self._client.get_channel(text_channel_id) if self._client else None
+        session_ref: Dict[str, Any] = {}
 
         async def _task_status(task: Dict[str, Any]) -> None:
-            if channel is None:
-                return
             task_id = str(task.get("task_id") or "")
             status = str(task.get("status") or "unknown")
             icon = {
@@ -3913,7 +3915,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 "failed": "❌",
                 "cancelled": "🛑",
             }.get(status, "ℹ️")
-            body = f"{icon} **Hermes task** `{task_id[-8:]}` — {status.replace('_', ' ')}"
+            body = f"{icon} **Task** `{task_id[-8:]}` — {status.replace('_', ' ')}"
             if task.get("approval"):
                 approval = task["approval"]
                 detail = approval.get("description") or approval.get("command") or "Approval required"
@@ -3922,15 +3924,19 @@ class DiscordAdapter(BasePlatformAdapter):
                 body += f"\n{str(task['output'])[:1500]}"
             elif task.get("error"):
                 body += f"\n{str(task['error'])[:1500]}"
-            key = (guild_id, task_id)
-            existing = self._realtime_task_messages.get(key)
-            try:
-                if existing is None:
-                    self._realtime_task_messages[key] = await channel.send(body)
-                else:
-                    await existing.edit(content=body)
-            except Exception:
-                logger.exception("Failed to update Discord Realtime task status")
+            if channel is not None:
+                key = (guild_id, task_id)
+                existing = self._realtime_task_messages.get(key)
+                try:
+                    if existing is None:
+                        self._realtime_task_messages[key] = await channel.send(body)
+                    else:
+                        await existing.edit(content=body)
+                except Exception:
+                    logger.exception("Failed to update Discord Realtime task status")
+            session = session_ref.get("session")
+            if session is not None:
+                await session.notify_task_status(task)
 
         owner_key = f"discord:{guild_id}:{text_channel_id}:{user_id}"
         brokers = getattr(self, "_realtime_voice_brokers", None)
@@ -3953,8 +3959,6 @@ class DiscordAdapter(BasePlatformAdapter):
             brokers[guild_id] = broker
         else:
             broker.status_callback = _task_status
-
-        session_ref: Dict[str, Any] = {}
 
         def _audio(pcm: bytes) -> None:
             if self._append_realtime_voice_pcm(guild_id, vc, pcm):
@@ -3992,6 +3996,7 @@ class DiscordAdapter(BasePlatformAdapter):
             vad_prefix_ms=int(cfg.get("vad_prefix_ms", 300)),
             vad_silence_ms=int(cfg.get("vad_silence_ms", 700)),
             input_silence_threshold=int(cfg.get("input_silence_threshold", 120)),
+            identity_context=load_realtime_identity_context(),
         )
         session_ref["session"] = session
         await session.start()
