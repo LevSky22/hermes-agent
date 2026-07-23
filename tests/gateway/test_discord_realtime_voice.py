@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from plugins.platforms.discord.adapter import DiscordAdapter
 from plugins.platforms.discord.realtime_broker import HermesRunBroker, REALTIME_TOOLS
 from plugins.platforms.discord.realtime_voice import (
     DiscordRealtimeSession,
@@ -91,6 +92,20 @@ def test_realtime_audio_source_flushes_partial_frame_once():
     assert len(chunk) == FRAME_SIZE
     assert chunk.startswith(b"\x01\x00" * 100)
     assert source.read() == b""
+
+
+def test_realtime_playback_guard_covers_active_source_and_tail():
+    adapter = DiscordAdapter.__new__(DiscordAdapter)
+    adapter._realtime_playback_sources = {1: MagicMock(closed=False)}
+    adapter._realtime_playback_guard_until = {}
+    assert adapter._is_realtime_playback_guarded(1)
+
+    adapter._realtime_playback_sources[1].closed = True
+    adapter._realtime_playback_guard_until[1] = time.monotonic() + 1
+    assert adapter._is_realtime_playback_guarded(1)
+
+    adapter._realtime_playback_guard_until[1] = time.monotonic() - 1
+    assert not adapter._is_realtime_playback_guarded(1)
 
 
 @pytest.mark.asyncio

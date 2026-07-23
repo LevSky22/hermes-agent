@@ -892,6 +892,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self._realtime_voice_sessions: Dict[int, Any] = {}  # guild_id -> DiscordRealtimeSession
         self._realtime_voice_brokers: Dict[int, Any] = {}  # guild_id -> HermesRunBroker
         self._realtime_playback_sources: Dict[int, Any] = {}
+        self._realtime_playback_guard_until: Dict[int, float] = {}
+        self._realtime_echo_guard_seconds: Dict[int, float] = {}
         self._realtime_task_messages: Dict[tuple[int, str], Any] = {}
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
@@ -3885,6 +3887,11 @@ class DiscordAdapter(BasePlatformAdapter):
             mixer.cleanup()
         if vc.is_playing():
             vc.stop()
+        barge_in_enabled = bool(cfg.get("barge_in_enabled", False))
+        self._realtime_echo_guard_seconds[guild_id] = max(
+            0.0,
+            float(cfg.get("echo_guard_ms", 350)) / 1000.0,
+        )
 
         from hermes_constants import get_hermes_home
         from .realtime_broker import HermesRunBroker
@@ -3989,6 +3996,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
         def _pcm_callback(frame_user_id: int, pcm: bytes) -> bool:
             if frame_user_id == user_id:
+                if (
+                    not barge_in_enabled
+                    and self._is_realtime_playback_guarded(guild_id)
+                ):
+                    return True
                 return session.feed_discord_pcm(frame_user_id, pcm)
             # Realtime mode owns the inbound path for this guild; do not leak
             # another participant into classic STT while it is active.
@@ -4004,6 +4016,8 @@ class DiscordAdapter(BasePlatformAdapter):
         if receiver is not None:
             receiver.set_pcm_callback(None)
         self._stop_realtime_voice_playback(guild_id)
+        self._realtime_echo_guard_seconds.pop(guild_id, None)
+        self._realtime_playback_guard_until.pop(guild_id, None)
         if session is None:
             return False
         await session.stop()
@@ -4034,6 +4048,10 @@ class DiscordAdapter(BasePlatformAdapter):
             def _clear() -> None:
                 if self._realtime_playback_sources.get(guild_id) is source:
                     self._realtime_playback_sources.pop(guild_id, None)
+                self._realtime_playback_guard_until[guild_id] = (
+                    time.monotonic()
+                    + self._realtime_echo_guard_seconds.get(guild_id, 0.35)
+                )
                 logger.info(
                     "Discord Realtime response playback ended (guild=%d)",
                     guild_id,
@@ -4055,10 +4073,20 @@ class DiscordAdapter(BasePlatformAdapter):
         logger.info("Discord Realtime response playback started (guild=%d)", guild_id)
         return True
 
+    def _is_realtime_playback_guarded(self, guild_id: int) -> bool:
+        source = self._realtime_playback_sources.get(guild_id)
+        if source is not None and not source.closed:
+            return True
+        return time.monotonic() < self._realtime_playback_guard_until.get(guild_id, 0.0)
+
     def _stop_realtime_voice_playback(self, guild_id: int) -> None:
         source = self._realtime_playback_sources.pop(guild_id, None)
         if source is not None:
             source.close()
+            self._realtime_playback_guard_until[guild_id] = (
+                time.monotonic()
+                + self._realtime_echo_guard_seconds.get(guild_id, 0.35)
+            )
         vc = self._voice_clients.get(guild_id)
         if vc is not None and vc.is_playing():
             vc.stop()
