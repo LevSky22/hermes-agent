@@ -43,7 +43,9 @@ the mixer's output cannot echo back into transcription.
 """
 
 import logging
+import queue
 import threading
+import time
 from collections import deque
 from typing import TYPE_CHECKING, List, Optional
 
@@ -75,6 +77,80 @@ FRAME_LENGTH_MS = 20
 SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_LENGTH_MS // 1000   # 960
 FRAME_SIZE = SAMPLES_PER_FRAME * CHANNELS * SAMPLE_WIDTH    # 3840 bytes
 SILENCE_FRAME = b"\x00" * FRAME_SIZE
+
+
+class RealtimePCMQueueAudioSource(discord.AudioSource):
+    """Response-scoped Discord PCM source for Realtime audio.
+
+    Unlike :class:`VoiceMixer`, this source ends after a short idle grace
+    period. Discord therefore shows the bot as speaking only while response
+    audio is actually flowing instead of for the entire voice connection.
+    """
+
+    IDLE_TIMEOUT_SECONDS = 0.6
+    MAX_FRAMES = 1500  # 30 seconds at 20 ms/frame
+
+    def __init__(self, pcm: bytes = b""):
+        self._frames: "queue.Queue[bytes]" = queue.Queue(maxsize=self.MAX_FRAMES)
+        self._pending = bytearray()
+        self._closed = False
+        self._last_feed_at = time.monotonic()
+        if pcm:
+            self.feed(pcm)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def feed(self, pcm: bytes) -> bool:
+        """Append Discord-native PCM, returning false on bounded overrun."""
+        if self._closed or not pcm:
+            return not self._closed
+        self._last_feed_at = time.monotonic()
+        self._pending.extend(pcm)
+        while len(self._pending) >= FRAME_SIZE:
+            frame = bytes(self._pending[:FRAME_SIZE])
+            del self._pending[:FRAME_SIZE]
+            try:
+                self._frames.put_nowait(frame)
+            except queue.Full:
+                self.close()
+                return False
+        return True
+
+    def close(self) -> None:
+        self._closed = True
+        self._pending.clear()
+        while True:
+            try:
+                self._frames.get_nowait()
+            except queue.Empty:
+                break
+
+    def cleanup(self) -> None:
+        self.close()
+
+    def read(self) -> bytes:
+        if self._closed:
+            return b""
+        try:
+            return self._frames.get_nowait()
+        except queue.Empty:
+            pass
+
+        idle_for = time.monotonic() - self._last_feed_at
+        if self._pending and idle_for >= self.IDLE_TIMEOUT_SECONDS:
+            chunk = bytes(self._pending)
+            self._pending.clear()
+            self._closed = True
+            return chunk + (b"\x00" * (FRAME_SIZE - len(chunk)))
+        if idle_for < self.IDLE_TIMEOUT_SECONDS:
+            return SILENCE_FRAME
+        self._closed = True
+        return b""
+
+    def is_opus(self) -> bool:
+        return False
 
 
 class MixerChild:

@@ -13,7 +13,11 @@ from plugins.platforms.discord.realtime_voice import (
     pcm_48k_stereo_to_24k_mono,
     pcm_rms,
 )
-from plugins.platforms.discord.voice_mixer import FRAME_SIZE, VoiceMixer
+from plugins.platforms.discord.voice_mixer import (
+    FRAME_SIZE,
+    RealtimePCMQueueAudioSource,
+    VoiceMixer,
+)
 
 
 def test_realtime_exposes_exactly_five_narrow_tools():
@@ -40,25 +44,74 @@ def test_pcm_rms_distinguishes_silence_and_speech():
 
 
 @pytest.mark.asyncio
-async def test_realtime_filters_silence_and_manually_finalizes_turn():
+async def test_realtime_gates_idle_silence_but_forwards_vad_tail():
     session = DiscordRealtimeSession(
         api_key="key",
         broker=MagicMock(),
         audio_callback=lambda _pcm: None,
-        manual_turn_timeout_ms=100,
+        vad_prefix_ms=40,
+        vad_silence_ms=100,
     )
     session._loop = asyncio.get_running_loop()
     session._ws = AsyncMock()
-    session.feed_discord_pcm(1, b"\x00\x00" * 960)
+    silence = b"\x00\x00" * 1920
+    speech = array("h", [1000] * 1920).tobytes()
+
+    session.feed_discord_pcm(1, silence)
     await asyncio.sleep(0)
     assert session._input.empty()
 
-    speech = array("h", [1000] * 960).tobytes()
     session.feed_discord_pcm(1, speech)
-    await asyncio.sleep(0.14)
-    sent = [json.loads(call.args[0]) for call in session._ws.send.await_args_list]
-    assert {"type": "input_audio_buffer.commit"} in sent
-    assert {"type": "response.create"} in sent
+    await asyncio.sleep(0)
+    # One 20ms pre-roll frame plus the speech frame entered the send queue.
+    assert session._input.qsize() == 2
+
+    session._last_loud_input_at = time.monotonic() - 0.2
+    session.feed_discord_pcm(1, silence)
+    await asyncio.sleep(0)
+    assert session._input.qsize() == 3
+    assert not session._input_gate_open
+    # Server VAD owns commit and response creation; the client only appends.
+    assert session._ws.send.await_count == 0
+
+
+def test_realtime_audio_source_ends_after_idle_grace():
+    frame = b"\x01\x00" * (FRAME_SIZE // 2)
+    source = RealtimePCMQueueAudioSource(frame)
+    assert source.read() == frame
+    source._last_feed_at = time.monotonic() - 1
+    assert source.read() == b""
+    assert source.closed
+
+
+def test_realtime_audio_source_flushes_partial_frame_once():
+    source = RealtimePCMQueueAudioSource(b"\x01\x00" * 100)
+    source._last_feed_at = time.monotonic() - 1
+    chunk = source.read()
+    assert len(chunk) == FRAME_SIZE
+    assert chunk.startswith(b"\x01\x00" * 100)
+    assert source.read() == b""
+
+
+@pytest.mark.asyncio
+async def test_local_speech_gate_interrupts_playback_once():
+    callback = AsyncMock()
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+        text_callback=callback,
+    )
+    session._loop = asyncio.get_running_loop()
+    session._active_response = True
+    speech = array("h", [1000] * 1920).tobytes()
+
+    session.feed_discord_pcm(1, speech)
+    session.feed_discord_pcm(1, speech)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    callback.assert_awaited_once_with("barge_in", "")
 
 
 def test_voice_mixer_stream_is_bounded_and_clears_on_overrun():

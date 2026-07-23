@@ -891,6 +891,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
         self._realtime_voice_sessions: Dict[int, Any] = {}  # guild_id -> DiscordRealtimeSession
         self._realtime_voice_brokers: Dict[int, Any] = {}  # guild_id -> HermesRunBroker
+        self._realtime_playback_sources: Dict[int, Any] = {}
         self._realtime_task_messages: Dict[tuple[int, str], Any] = {}
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
@@ -3818,6 +3819,7 @@ class DiscordAdapter(BasePlatformAdapter):
             realtime = getattr(self, "_realtime_voice_sessions", {}).pop(guild_id, None)
             if realtime is not None:
                 await realtime.stop()
+            self._stop_realtime_voice_playback(guild_id)
             # Stop voice receiver first
             receiver = self._voice_receivers.pop(guild_id, None)
             if receiver:
@@ -3875,9 +3877,14 @@ class DiscordAdapter(BasePlatformAdapter):
         if not api_server_key:
             raise RuntimeError("API_SERVER_KEY is not configured")
 
-        if guild_id not in self._voice_mixers:
-            await self._install_voice_mixer(guild_id, vc)
-        mixer = self._voice_mixers[guild_id]
+        # Realtime playback is response-scoped. A continuous VoiceMixer emits
+        # non-empty silent PCM forever, which makes Discord show the bot as
+        # permanently speaking even when ambient audio is disabled.
+        mixer = self._voice_mixers.pop(guild_id, None)
+        if mixer is not None:
+            mixer.cleanup()
+        if vc.is_playing():
+            vc.stop()
 
         from hermes_constants import get_hermes_home
         from .realtime_broker import HermesRunBroker
@@ -3943,7 +3950,7 @@ class DiscordAdapter(BasePlatformAdapter):
         session_ref: Dict[str, Any] = {}
 
         def _audio(pcm: bytes) -> None:
-            if mixer.append_streaming_speech(pcm):
+            if self._append_realtime_voice_pcm(guild_id, vc, pcm):
                 return
             session = session_ref.get("session")
             if session is not None:
@@ -3951,7 +3958,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         async def _transcript(role: str, text: str) -> None:
             if role == "barge_in":
-                mixer.clear_streaming_speech()
+                self._stop_realtime_voice_playback(guild_id)
                 return
             if channel is None or not text:
                 return
@@ -3976,7 +3983,6 @@ class DiscordAdapter(BasePlatformAdapter):
             vad_prefix_ms=int(cfg.get("vad_prefix_ms", 300)),
             vad_silence_ms=int(cfg.get("vad_silence_ms", 700)),
             input_silence_threshold=int(cfg.get("input_silence_threshold", 120)),
-            manual_turn_timeout_ms=int(cfg.get("manual_turn_timeout_ms", 700)),
         )
         session_ref["session"] = session
         await session.start()
@@ -3997,13 +4003,65 @@ class DiscordAdapter(BasePlatformAdapter):
         receiver = self._voice_receivers.get(guild_id)
         if receiver is not None:
             receiver.set_pcm_callback(None)
-        mixer = self._voice_mixers.get(guild_id)
-        if mixer is not None:
-            mixer.clear_streaming_speech()
+        self._stop_realtime_voice_playback(guild_id)
         if session is None:
             return False
         await session.stop()
         return True
+
+    def _append_realtime_voice_pcm(self, guild_id: int, vc, pcm: bytes) -> bool:
+        """Feed response PCM into a short-lived Discord AudioSource."""
+        from .voice_mixer import RealtimePCMQueueAudioSource
+
+        source = self._realtime_playback_sources.get(guild_id)
+        if source is not None and not source.closed:
+            return source.feed(pcm)
+
+        if vc.is_playing():
+            vc.stop()
+        source = RealtimePCMQueueAudioSource(pcm)
+        self._realtime_playback_sources[guild_id] = source
+        loop = asyncio.get_running_loop()
+
+        def _after(error) -> None:
+            if error:
+                logger.error(
+                    "Discord Realtime playback error (guild=%d): %s",
+                    guild_id,
+                    error,
+                )
+
+            def _clear() -> None:
+                if self._realtime_playback_sources.get(guild_id) is source:
+                    self._realtime_playback_sources.pop(guild_id, None)
+                logger.info(
+                    "Discord Realtime response playback ended (guild=%d)",
+                    guild_id,
+                )
+
+            loop.call_soon_threadsafe(_clear)
+
+        try:
+            vc.play(source, after=_after)
+        except Exception:
+            if self._realtime_playback_sources.get(guild_id) is source:
+                self._realtime_playback_sources.pop(guild_id, None)
+            source.close()
+            logger.exception(
+                "Discord Realtime response playback could not start (guild=%d)",
+                guild_id,
+            )
+            return False
+        logger.info("Discord Realtime response playback started (guild=%d)", guild_id)
+        return True
+
+    def _stop_realtime_voice_playback(self, guild_id: int) -> None:
+        source = self._realtime_playback_sources.pop(guild_id, None)
+        if source is not None:
+            source.close()
+        vc = self._voice_clients.get(guild_id)
+        if vc is not None and vc.is_playing():
+            vc.stop()
 
     def realtime_voice_status(self, guild_id: int) -> Optional[Dict[str, Any]]:
         session = getattr(self, "_realtime_voice_sessions", {}).get(guild_id)

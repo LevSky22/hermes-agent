@@ -90,7 +90,6 @@ class DiscordRealtimeSession:
         vad_prefix_ms: int = 300,
         vad_silence_ms: int = 700,
         input_silence_threshold: int = 120,
-        manual_turn_timeout_ms: int = 700,
         instructions: str = DEFAULT_INSTRUCTIONS,
         history_turns: int = 50,
         session_rotation_seconds: int = 3000,
@@ -109,7 +108,6 @@ class DiscordRealtimeSession:
         self.vad_prefix_ms = max(0, int(vad_prefix_ms))
         self.vad_silence_ms = max(100, int(vad_silence_ms))
         self.input_silence_threshold = max(0, int(input_silence_threshold))
-        self.manual_turn_timeout_ms = max(100, int(manual_turn_timeout_ms))
         self.instructions = instructions
         self.history_turns = max(4, int(history_turns))
         self.session_rotation_seconds = max(300, int(session_rotation_seconds))
@@ -126,9 +124,11 @@ class DiscordRealtimeSession:
         self._connected = asyncio.Event()
         self._active_response = False
         self._handled_call_ids: set[str] = set()
-        self._turn_timer: Optional[asyncio.TimerHandle] = None
-        self._turn_has_audio = False
-        self._last_input_audio_at = 0.0
+        self._input_gate_open = False
+        self._last_loud_input_at = 0.0
+        self._input_preroll: deque[bytes] = deque()
+        self._input_preroll_bytes = 0
+        self._barge_in_notified = False
         self._sent_audio_chunks = 0
         self._received_audio_chunks = 0
         self._session_updated_logged = False
@@ -160,7 +160,7 @@ class DiscordRealtimeSession:
     async def stop(self, *, close_broker: bool = False) -> None:
         self._stopping = True
         self._connected.clear()
-        self._cancel_turn_timer()
+        self._reset_input_gate()
         tasks = [task for task in (self._sender, self._runner) if task is not None]
         for task in tasks:
             task.cancel()
@@ -179,8 +179,7 @@ class DiscordRealtimeSession:
 
     def pause(self) -> None:
         self._paused = True
-        self._cancel_turn_timer()
-        self._turn_has_audio = False
+        self._reset_input_gate()
         self._clear_input()
 
     def resume(self) -> None:
@@ -194,15 +193,57 @@ class DiscordRealtimeSession:
         if not converted:
             return True
         rms = pcm_rms(converted)
-        if rms < self.input_silence_threshold:
-            return True
-        self._loop.call_soon_threadsafe(self._enqueue_input, converted)
+        self._loop.call_soon_threadsafe(self._process_input_chunk, converted, rms)
         return True
 
     async def cancel_response(self) -> None:
         if self._ws is not None and self._active_response:
             await self._send({"type": "response.cancel"})
         self._active_response = False
+
+    def _process_input_chunk(self, pcm: bytes, rms: float) -> None:
+        """Gate idle noise while preserving speech prefix and trailing silence.
+
+        Server VAD needs silence after an utterance to detect the end of the
+        turn. Dropping every low-RMS frame prevents that event. Keep a bounded
+        prefix while idle, then forward all frames through the VAD window.
+        """
+        now = time.monotonic()
+        loud = rms >= self.input_silence_threshold
+        if not self._input_gate_open:
+            if not loud:
+                self._append_input_preroll(pcm)
+                return
+            self._input_gate_open = True
+            self._last_loud_input_at = now
+            if self._active_response and not self._barge_in_notified:
+                self._barge_in_notified = True
+                if self.text_callback and self._loop is not None:
+                    self._loop.create_task(self.text_callback("barge_in", ""))
+            while self._input_preroll:
+                self._enqueue_input(self._input_preroll.popleft())
+            self._input_preroll_bytes = 0
+        elif loud:
+            self._last_loud_input_at = now
+
+        self._enqueue_input(pcm)
+        if not loud and (now - self._last_loud_input_at) * 1000 >= self.vad_silence_ms:
+            self._input_gate_open = False
+
+    def _append_input_preroll(self, pcm: bytes) -> None:
+        limit = max(0, 24000 * 2 * self.vad_prefix_ms // 1000)
+        if limit == 0:
+            return
+        self._input_preroll.append(pcm)
+        self._input_preroll_bytes += len(pcm)
+        while self._input_preroll and self._input_preroll_bytes > limit:
+            self._input_preroll_bytes -= len(self._input_preroll.popleft())
+
+    def _reset_input_gate(self) -> None:
+        self._input_gate_open = False
+        self._last_loud_input_at = 0.0
+        self._input_preroll.clear()
+        self._input_preroll_bytes = 0
 
     def _enqueue_input(self, pcm: bytes) -> None:
         self._sent_audio_chunks += 1
@@ -217,58 +258,12 @@ class DiscordRealtimeSession:
                 self._input.get_nowait()
             except asyncio.QueueEmpty:
                 pass
+            else:
+                self._input.task_done()
         try:
             self._input.put_nowait(pcm)
         except asyncio.QueueFull:
             pass
-        self._turn_has_audio = True
-        self._last_input_audio_at = time.monotonic()
-        self._schedule_turn_finalize()
-
-    def _schedule_turn_finalize(self) -> None:
-        self._cancel_turn_timer()
-        if self._loop is None or self._loop.is_closed():
-            return
-        self._turn_timer = self._loop.call_later(
-            self.manual_turn_timeout_ms / 1000.0,
-            self._turn_timeout_fired,
-        )
-
-    def _cancel_turn_timer(self) -> None:
-        timer = self._turn_timer
-        self._turn_timer = None
-        if timer is not None:
-            timer.cancel()
-
-    def _turn_timeout_fired(self) -> None:
-        self._turn_timer = None
-        if self._loop is None or self._loop.is_closed():
-            return
-        self._loop.create_task(self._finalize_input_turn())
-
-    async def _finalize_input_turn(self) -> None:
-        if self._stopping or self._paused or not self._turn_has_audio or self._ws is None:
-            return
-        elapsed_ms = (time.monotonic() - self._last_input_audio_at) * 1000
-        if elapsed_ms < self.manual_turn_timeout_ms:
-            self._schedule_turn_finalize()
-            return
-        # A provider-created response means server VAD already finalized this
-        # turn. Avoid a duplicate commit/response in that case.
-        if self._active_response:
-            self._turn_has_audio = False
-            return
-        self._turn_has_audio = False
-        logger.info(
-            "Discord Realtime finalizing input turn after %dms silence",
-            self.manual_turn_timeout_ms,
-        )
-        try:
-            await self._send({"type": "input_audio_buffer.commit"})
-            await self._send({"type": "response.create"})
-        except Exception as exc:
-            self.last_error = str(exc)
-            logger.warning("Discord Realtime turn finalization failed: %s", exc)
 
     def _clear_input(self) -> None:
         while True:
@@ -276,6 +271,8 @@ class DiscordRealtimeSession:
                 self._input.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            else:
+                self._input.task_done()
 
     async def _run(self) -> None:
         delay = 1.0
@@ -413,19 +410,22 @@ class DiscordRealtimeSession:
     async def _send_audio(self) -> None:
         while True:
             pcm = await self._input.get()
-            if self._paused or not pcm:
-                continue
-            await self._send({
-                "type": "input_audio_buffer.append",
-                "audio": base64.b64encode(pcm).decode("ascii"),
-            })
+            try:
+                if self._paused or not pcm:
+                    continue
+                await self._send({
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(pcm).decode("ascii"),
+                })
+            finally:
+                self._input.task_done()
 
     async def _handle_event(self, event: dict[str, Any]) -> None:
         kind = str(event.get("type") or "")
         if kind == "input_audio_buffer.speech_started":
-            self._active_response = False
             logger.info("Discord Realtime VAD event: %s", kind)
-            if self.text_callback:
+            if self.text_callback and not self._barge_in_notified:
+                self._barge_in_notified = True
                 await self.text_callback("barge_in", "")
             return
         if kind == "input_audio_buffer.speech_stopped":
@@ -440,10 +440,13 @@ class DiscordRealtimeSession:
                     self.voice,
                 )
             return
-        if kind in {"response.created", "response.output_item.added"}:
+        if kind == "response.created":
             self._active_response = True
-            self._turn_has_audio = False
-            self._cancel_turn_timer()
+            self._barge_in_notified = False
+            logger.info("Discord Realtime response event: %s", kind)
+            return
+        if kind == "response.output_item.added":
+            self._active_response = True
             logger.info("Discord Realtime response event: %s", kind)
             return
         if kind == "conversation.item.input_audio_transcription.completed":
@@ -487,6 +490,7 @@ class DiscordRealtimeSession:
             return
         if kind == "response.done":
             self._active_response = False
+            self._barge_in_notified = False
             response = event.get("response") or {}
             for item in response.get("output") or []:
                 if item.get("type") == "function_call":
