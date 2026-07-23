@@ -2614,6 +2614,26 @@ DEFAULT_CONFIG = {
                 "On it.",
             ],
         },
+        # Low-latency GPT Realtime voice is an explicit opt-in mode selected
+        # with /voice realtime. The API credential remains in .env; behavior
+        # and limits live here so they are reviewable and profile-scoped.
+        "realtime_voice": {
+            "enabled": False,
+            "model": "gpt-realtime-2.1",
+            "voice": "cedar",
+            "reasoning_effort": "low",
+            "transcription_enabled": True,
+            "transcription_model": "gpt-4o-mini-transcribe",
+            "vad_threshold": 0.7,
+            "vad_prefix_ms": 300,
+            "vad_silence_ms": 700,
+            "input_silence_threshold": 120,
+            "manual_turn_timeout_ms": 700,
+            "max_active_tasks": 2,
+            "max_queued_tasks": 5,
+            "background_model": "",
+            "api_server_url": "http://127.0.0.1:8642",
+        },
     },
 
     # WhatsApp platform settings (gateway mode)
@@ -4139,6 +4159,15 @@ OPTIONAL_ENV_VARS = {
         "tools": ["voice_transcription", "openai_tts"],
         "password": True,
         "category": "tool",
+    },
+    "OPENAI_REALTIME_API_KEY": {
+        "description": "Dedicated OpenAI API key for Discord GPT Realtime voice",
+        "prompt": "OpenAI Realtime API key",
+        "url": "https://platform.openai.com/api-keys",
+        "tools": ["discord_realtime_voice"],
+        "password": True,
+        "category": "messaging",
+        "advanced": True,
     },
     "ELEVENLABS_API_KEY": {
         "description": "ElevenLabs API key for premium text-to-speech voices and Scribe transcription",

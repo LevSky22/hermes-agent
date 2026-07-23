@@ -110,6 +110,30 @@ class TestHandleVoiceCommand:
         assert runner._voice_mode["telegram:123"] == "off"
 
     @pytest.mark.asyncio
+    async def test_discord_voice_off_stops_realtime(self, runner):
+        from gateway.config import Platform
+
+        source = SessionSource(
+            chat_id="123",
+            user_id="user1",
+            platform=Platform.DISCORD,
+        )
+        event = MessageEvent(
+            text="/voice off",
+            message_type=MessageType.TEXT,
+            source=source,
+        )
+        event.raw_message = SimpleNamespace(guild_id=111, guild=None)
+        adapter = MagicMock()
+        adapter.stop_realtime_voice = AsyncMock(return_value=True)
+        runner.adapters[Platform.DISCORD] = adapter
+
+        result = await runner._handle_voice_command(event)
+
+        assert "disabled" in result.lower()
+        adapter.stop_realtime_voice.assert_awaited_once_with(111)
+
+    @pytest.mark.asyncio
     async def test_voice_tts(self, runner):
         event = _make_event("/voice tts")
         result = await runner._handle_voice_command(event)

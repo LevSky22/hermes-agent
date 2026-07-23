@@ -456,6 +456,10 @@ class VoiceReceiver:
 
         # Pause flag: don't capture while bot is playing TTS
         self._paused = False
+        # Optional low-latency consumer. It runs on discord.py's socket thread
+        # and returns True when it consumed the frame, bypassing utterance
+        # buffering and the classic STT path.
+        self._pcm_callback: Optional[Callable[[int, bytes], bool]] = None
 
         # Debug logging counter (instance-level to avoid cross-instance races)
         self._packet_debug_count = 0
@@ -495,6 +499,9 @@ class VoiceReceiver:
 
     def resume(self):
         self._paused = False
+
+    def set_pcm_callback(self, callback: Optional[Callable[[int, bytes], bool]]) -> None:
+        self._pcm_callback = callback
 
     # ------------------------------------------------------------------
     # SSRC -> user_id mapping via SPEAKING opcode hook
@@ -669,8 +676,17 @@ class VoiceReceiver:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
             with self._lock:
-                self._buffers[ssrc].extend(pcm)
-                self._last_packet_time[ssrc] = time.monotonic()
+                user_id = self._ssrc_to_user.get(ssrc, 0)
+            consumed = False
+            if user_id and self._pcm_callback is not None:
+                try:
+                    consumed = bool(self._pcm_callback(user_id, pcm))
+                except Exception:
+                    logger.exception("Realtime PCM callback failed for user=%s", user_id)
+            if not consumed:
+                with self._lock:
+                    self._buffers[ssrc].extend(pcm)
+                    self._last_packet_time[ssrc] = time.monotonic()
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
@@ -913,6 +929,12 @@ class DiscordAdapter(BasePlatformAdapter):
         # Installed once per guild on join; lets acks / TTS / the "thinking"
         # loop overlap in one outgoing stream instead of stop-and-swap.
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
+        self._realtime_voice_sessions: Dict[int, Any] = {}  # guild_id -> DiscordRealtimeSession
+        self._realtime_voice_brokers: Dict[int, Any] = {}  # guild_id -> HermesRunBroker
+        self._realtime_playback_sources: Dict[int, Any] = {}
+        self._realtime_playback_guard_until: Dict[int, float] = {}
+        self._realtime_echo_guard_seconds: Dict[int, float] = {}
+        self._realtime_task_messages: Dict[tuple[int, str], Any] = {}
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
         # Track threads where the bot has participated so follow-up messages
@@ -1657,6 +1679,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self.leave_voice_channel(guild_id)
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.debug("[%s] Error leaving voice channel %s: %s", self.name, guild_id, e)
+        for guild_id, broker in list(getattr(self, "_realtime_voice_brokers", {}).items()):
+            try:
+                await broker.close()
+            except Exception as e:
+                logger.debug("[%s] Error closing Realtime broker %s: %s", self.name, guild_id, e)
+        getattr(self, "_realtime_voice_brokers", {}).clear()
 
         if self._client:
             try:
@@ -3802,6 +3830,10 @@ class DiscordAdapter(BasePlatformAdapter):
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
+            realtime = getattr(self, "_realtime_voice_sessions", {}).pop(guild_id, None)
+            if realtime is not None:
+                await realtime.stop()
+            self._stop_realtime_voice_playback(guild_id)
             # Stop voice receiver first
             receiver = self._voice_receivers.pop(guild_id, None)
             if receiver:
@@ -3827,6 +3859,296 @@ class DiscordAdapter(BasePlatformAdapter):
                 task.cancel()
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
+
+    async def start_realtime_voice(
+        self,
+        guild_id: int,
+        *,
+        user_id: int,
+        text_channel_id: int,
+    ) -> None:
+        """Switch an existing Discord voice connection to GPT Realtime."""
+        if guild_id in self._realtime_voice_sessions:
+            return
+        vc = self._voice_clients.get(guild_id)
+        receiver = self._voice_receivers.get(guild_id)
+        if vc is None or not vc.is_connected() or receiver is None:
+            raise RuntimeError("Join a Discord voice channel before enabling Realtime")
+
+        try:
+            from hermes_cli.config import read_raw_config
+            raw_cfg = read_raw_config() or {}
+        except Exception:
+            raw_cfg = {}
+        cfg = ((raw_cfg.get("discord") or {}).get("realtime_voice") or {})
+        if not isinstance(cfg, dict) or not cfg.get("enabled", False):
+            raise RuntimeError("Discord Realtime voice is disabled in config.yaml")
+
+        openai_key = os.getenv("OPENAI_REALTIME_API_KEY", "").strip()
+        api_server_key = os.getenv("API_SERVER_KEY", "").strip()
+        if not openai_key:
+            raise RuntimeError("OPENAI_REALTIME_API_KEY is not configured")
+        if not api_server_key:
+            raise RuntimeError("API_SERVER_KEY is not configured")
+
+        # Realtime playback is response-scoped. A continuous VoiceMixer emits
+        # non-empty silent PCM forever, which makes Discord show the bot as
+        # permanently speaking even when ambient audio is disabled.
+        mixer = self._voice_mixers.pop(guild_id, None)
+        if mixer is not None:
+            mixer.cleanup()
+        if vc.is_playing():
+            vc.stop()
+        barge_in_enabled = bool(cfg.get("barge_in_enabled", False))
+        self._realtime_echo_guard_seconds[guild_id] = max(
+            0.0,
+            float(cfg.get("echo_guard_ms", 350)) / 1000.0,
+        )
+
+        from hermes_constants import get_hermes_home
+        from .realtime_broker import HermesRunBroker
+        from .realtime_voice import (
+            DiscordRealtimeSession,
+            load_realtime_identity_context,
+        )
+
+        channel = self._client.get_channel(text_channel_id) if self._client else None
+        session_ref: Dict[str, Any] = {}
+
+        async def _task_status(task: Dict[str, Any]) -> None:
+            task_id = str(task.get("task_id") or "")
+            status = str(task.get("status") or "unknown")
+            icon = {
+                "queued": "⏳",
+                "starting": "⏳",
+                "running": "⚙️",
+                "waiting_for_approval": "⚠️",
+                "completed": "✅",
+                "failed": "❌",
+                "cancelled": "🛑",
+            }.get(status, "ℹ️")
+            body = f"{icon} **Task** `{task_id[-8:]}` — {status.replace('_', ' ')}"
+            if task.get("approval"):
+                approval = task["approval"]
+                detail = approval.get("description") or approval.get("command") or "Approval required"
+                body += f"\n{str(detail)[:1200]}\nApproval ID: `{task.get('approval_id')}`"
+            elif task.get("output"):
+                body += f"\n{str(task['output'])[:1500]}"
+            elif task.get("error"):
+                body += f"\n{str(task['error'])[:1500]}"
+            elif task.get("progress"):
+                body += f"\n{str(task['progress'])[:500]}"
+            if channel is not None:
+                key = (guild_id, task_id)
+                existing = self._realtime_task_messages.get(key)
+                try:
+                    if existing is None:
+                        self._realtime_task_messages[key] = await channel.send(body)
+                    else:
+                        await existing.edit(content=body)
+                except Exception:
+                    logger.exception("Failed to update Discord Realtime task status")
+            session = session_ref.get("session")
+            if session is not None:
+                if status == "completed":
+                    # A completed task may have updated USER.md, MEMORY.md, or
+                    # SOUL.md. Keep the ongoing Realtime session aligned with
+                    # Hermes' canonical on-disk context without reconnecting.
+                    await session.refresh_identity_context(
+                        load_realtime_identity_context()
+                    )
+                await session.notify_task_status(task)
+
+        owner_key = f"discord:{guild_id}:{text_channel_id}:{user_id}"
+        brokers = getattr(self, "_realtime_voice_brokers", None)
+        if brokers is None:
+            brokers = {}
+            self._realtime_voice_brokers = brokers
+        broker = brokers.get(guild_id)
+        if broker is None or broker.owner_key != owner_key:
+            if broker is not None:
+                await broker.close()
+            broker = HermesRunBroker(
+                owner_key=owner_key,
+                api_key=api_server_key,
+                store_path=get_hermes_home() / "realtime_voice.sqlite3",
+                base_url=str(cfg.get("api_server_url") or "http://127.0.0.1:8642"),
+                max_active=int(cfg.get("max_active_tasks", 2)),
+                max_queued=int(cfg.get("max_queued_tasks", 5)),
+                progress_after_seconds=float(
+                    cfg.get("progress_after_seconds", 12)
+                ),
+                progress_interval_seconds=float(
+                    cfg.get("progress_interval_seconds", 30)
+                ),
+                background_model=cfg.get("background_model"),
+                status_callback=_task_status,
+            )
+            brokers[guild_id] = broker
+        else:
+            broker.status_callback = _task_status
+
+        def _audio(pcm: bytes) -> None:
+            if self._append_realtime_voice_pcm(guild_id, vc, pcm):
+                return
+            session = session_ref.get("session")
+            if session is not None:
+                asyncio.run_coroutine_threadsafe(session.cancel_response(), session._loop)
+
+        async def _transcript(role: str, text: str) -> None:
+            if role == "barge_in":
+                self._stop_realtime_voice_playback(guild_id)
+                return
+            if channel is None or not text:
+                return
+            safe = text[:1900].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+            assistant_label = (
+                getattr(getattr(self, "user", None), "display_name", None)
+                or getattr(getattr(self, "user", None), "name", None)
+                or "Assistant"
+            )
+            label = f"<@{user_id}>" if role == "user" else assistant_label
+            await channel.send(f"**[Realtime voice · {label}]** {safe}")
+
+        session = DiscordRealtimeSession(
+            api_key=openai_key,
+            broker=broker,
+            audio_callback=_audio,
+            text_callback=_transcript,
+            model=str(cfg.get("model") or "gpt-realtime-2.1"),
+            voice=str(cfg.get("voice") or "cedar"),
+            reasoning_effort=str(cfg.get("reasoning_effort") or "low"),
+            transcription_model=(
+                str(cfg.get("transcription_model") or "gpt-4o-mini-transcribe")
+                if cfg.get("transcription_enabled", True)
+                else None
+            ),
+            vad_type=str(cfg.get("vad_type") or "server_vad"),
+            vad_eagerness=str(cfg.get("vad_eagerness") or "auto"),
+            vad_threshold=float(cfg.get("vad_threshold", 0.7)),
+            vad_prefix_ms=int(cfg.get("vad_prefix_ms", 300)),
+            vad_silence_ms=int(cfg.get("vad_silence_ms", 700)),
+            input_silence_threshold=int(cfg.get("input_silence_threshold", 120)),
+            identity_context=load_realtime_identity_context(),
+        )
+        session_ref["session"] = session
+
+        def _pcm_callback(frame_user_id: int, pcm: bytes) -> bool:
+            if frame_user_id == user_id:
+                if (
+                    not barge_in_enabled
+                    and self._is_realtime_playback_guarded(guild_id)
+                ):
+                    return True
+                return session.feed_discord_pcm(frame_user_id, pcm)
+            # Realtime mode owns the inbound path for this guild; do not leak
+            # another participant into classic STT while it is active.
+            return True
+
+        # Attach the receiver before the OpenAI handshake so speech beginning
+        # while /voice realtime is starting is buffered instead of discarded.
+        receiver.set_pcm_callback(_pcm_callback)
+        try:
+            await session.start()
+        except Exception:
+            receiver.set_pcm_callback(None)
+            await session.stop()
+            raise
+        self._realtime_voice_sessions[guild_id] = session
+        logger.info("Discord Realtime voice enabled (guild=%s user=%s)", guild_id, user_id)
+
+    async def stop_realtime_voice(self, guild_id: int) -> bool:
+        session = self._realtime_voice_sessions.pop(guild_id, None)
+        receiver = self._voice_receivers.get(guild_id)
+        if receiver is not None:
+            receiver.set_pcm_callback(None)
+        self._stop_realtime_voice_playback(guild_id)
+        self._realtime_echo_guard_seconds.pop(guild_id, None)
+        self._realtime_playback_guard_until.pop(guild_id, None)
+        if session is None:
+            return False
+        await session.stop()
+        return True
+
+    def _append_realtime_voice_pcm(self, guild_id: int, vc, pcm: bytes) -> bool:
+        """Feed response PCM into a short-lived Discord AudioSource."""
+        from .voice_mixer import RealtimePCMQueueAudioSource
+
+        source = self._realtime_playback_sources.get(guild_id)
+        if source is not None and not source.closed:
+            return source.feed(pcm)
+
+        if vc.is_playing():
+            vc.stop()
+        source = RealtimePCMQueueAudioSource(pcm)
+        self._realtime_playback_sources[guild_id] = source
+        loop = asyncio.get_running_loop()
+
+        def _after(error) -> None:
+            if error:
+                logger.error(
+                    "Discord Realtime playback error (guild=%d): %s",
+                    guild_id,
+                    error,
+                )
+
+            def _clear() -> None:
+                if self._realtime_playback_sources.get(guild_id) is source:
+                    self._realtime_playback_sources.pop(guild_id, None)
+                self._realtime_playback_guard_until[guild_id] = (
+                    time.monotonic()
+                    + self._realtime_echo_guard_seconds.get(guild_id, 0.35)
+                )
+                logger.info(
+                    "Discord Realtime response playback ended (guild=%d)",
+                    guild_id,
+                )
+
+            loop.call_soon_threadsafe(_clear)
+
+        try:
+            vc.play(source, after=_after)
+        except Exception:
+            if self._realtime_playback_sources.get(guild_id) is source:
+                self._realtime_playback_sources.pop(guild_id, None)
+            source.close()
+            logger.exception(
+                "Discord Realtime response playback could not start (guild=%d)",
+                guild_id,
+            )
+            return False
+        logger.info("Discord Realtime response playback started (guild=%d)", guild_id)
+        return True
+
+    def _is_realtime_playback_guarded(self, guild_id: int) -> bool:
+        source = self._realtime_playback_sources.get(guild_id)
+        if source is not None and not source.closed:
+            return True
+        return time.monotonic() < self._realtime_playback_guard_until.get(guild_id, 0.0)
+
+    def _stop_realtime_voice_playback(self, guild_id: int) -> None:
+        source = self._realtime_playback_sources.pop(guild_id, None)
+        if source is not None:
+            source.close()
+            self._realtime_playback_guard_until[guild_id] = (
+                time.monotonic()
+                + self._realtime_echo_guard_seconds.get(guild_id, 0.35)
+            )
+        vc = self._voice_clients.get(guild_id)
+        if vc is not None and vc.is_playing():
+            vc.stop()
+
+    def realtime_voice_status(self, guild_id: int) -> Optional[Dict[str, Any]]:
+        session = getattr(self, "_realtime_voice_sessions", {}).get(guild_id)
+        if session is None:
+            return None
+        return {
+            "connected": session.connected,
+            "paused": session.paused,
+            "model": session.model,
+            "voice": session.voice,
+            "last_error": session.last_error,
+        }
 
     # Maximum seconds to wait for voice playback before giving up
     PLAYBACK_TIMEOUT = 120
@@ -5086,8 +5408,8 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_reload_skills(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/reload-skills")
 
-        @tree.command(name="voice", description="Toggle voice reply mode")
-        @discord.app_commands.describe(mode="Voice mode: join, channel, leave, on, tts, off, or status")
+        @tree.command(name="voice", description="Control classic or Realtime voice")
+        @discord.app_commands.describe(mode="Voice mode or action")
         @discord.app_commands.choices(mode=[
             # `join` and `channel` both route to _handle_voice_channel_join in
             # gateway/run.py — expose both in the slash UI so autocomplete
@@ -5095,6 +5417,9 @@ class DiscordAdapter(BasePlatformAdapter):
             # the command is typed as plain text.
             discord.app_commands.Choice(name="join — join your voice channel", value="join"),
             discord.app_commands.Choice(name="channel — join your voice channel (alias)", value="channel"),
+            discord.app_commands.Choice(name="realtime — low-latency delegated voice", value="realtime"),
+            discord.app_commands.Choice(name="pause — pause Realtime listening", value="pause"),
+            discord.app_commands.Choice(name="resume — resume Realtime listening", value="resume"),
             discord.app_commands.Choice(name="leave — leave voice channel", value="leave"),
             discord.app_commands.Choice(name="on — voice reply to voice messages", value="on"),
             discord.app_commands.Choice(name="tts — voice reply to all messages", value="tts"),

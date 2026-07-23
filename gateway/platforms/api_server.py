@@ -1034,6 +1034,7 @@ class APIServerAdapter(BasePlatformAdapter):
         #       api_key: "sk-…"          # optional — per-route UPSTREAM provider
         #                                # key override (NOT caller auth; never logged)
         #       base_url: "https://…"    # optional — per-route base URL override
+        #       reasoning_effort: "medium"  # optional — per-route override
         self._model_routes: Dict[str, Dict[str, Any]] = self._parse_model_routes(
             extra.get("model_routes"),
         )
@@ -1751,7 +1752,8 @@ class APIServerAdapter(BasePlatformAdapter):
     def _parse_model_routes(raw: Any) -> Dict[str, Dict[str, Any]]:
         """Validate and normalize the ``model_routes`` config block.
 
-        Accepts a mapping of ``alias -> {model, provider?, api_key?, base_url?}``.
+        Accepts a mapping of ``alias -> {model, provider?, api_key?, base_url?,
+        reasoning_effort?}``.
         Invalid shapes are dropped (never raised) so a config typo can't take
         the whole API server down.  Route values are coerced to strings.
 
@@ -1770,7 +1772,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             return {}
 
-        allowed_keys = ("model", "provider", "api_key", "base_url")
+        allowed_keys = (
+            "model",
+            "provider",
+            "api_key",
+            "base_url",
+            "reasoning_effort",
+        )
         routes: Dict[str, Dict[str, Any]] = {}
         for alias, cfg in raw.items():
             alias_str = str(alias).strip()
@@ -1911,6 +1919,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 runtime_kwargs["api_key"] = route["api_key"]
             if route.get("base_url"):
                 runtime_kwargs["base_url"] = route["base_url"]
+            if route.get("reasoning_effort"):
+                effort = route["reasoning_effort"].lower()
+                if effort in {
+                    "none", "minimal", "low", "medium", "high", "xhigh",
+                    "max", "ultra",
+                }:
+                    reasoning_config = (
+                        {"enabled": False}
+                        if effort == "none"
+                        else {"enabled": True, "effort": effort}
+                    )
+                else:
+                    logger.warning(
+                        "api_server model route has invalid reasoning_effort for model=%s",
+                        model,
+                    )
             logger.debug(
                 "api_server model route applied: model=%s provider=%s",
                 model,
@@ -2105,6 +2129,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                "run_session_resume": True,
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
@@ -4929,6 +4954,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
+        resume_session = _coerce_request_bool(body.get("resume_session"), False)
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
@@ -4976,6 +5002,38 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
+        if resume_session:
+            if not body.get("session_id"):
+                return web.json_response(
+                    _openai_error(
+                        "'resume_session' requires an explicit 'session_id'",
+                        code="invalid_session_id",
+                    ),
+                    status=400,
+                )
+            if conversation_history:
+                return web.json_response(
+                    _openai_error(
+                        "'resume_session' cannot be combined with explicit conversation history",
+                        code="invalid_request_error",
+                    ),
+                    status=400,
+                )
+            _, session_err = await self._get_existing_session_or_404(str(session_id))
+            if session_err is not None:
+                return session_err
+            session_db = await self._ensure_session_db_async()
+            if session_db is None:
+                return web.json_response(
+                    _openai_error("Session database unavailable", code="session_db_unavailable"),
+                    status=503,
+                )
+            resolved_session_id = await asyncio.to_thread(
+                session_db.resolve_resume_session_id,
+                str(session_id),
+            )
+            session_id = resolved_session_id or str(session_id)
+            conversation_history = await self._conversation_history_for_session(session_id)
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -5034,11 +5092,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     _put_event_if_active({
                         "event": "run.cancelled",
                         "run_id": run_id,
+                        "session_id": session_id,
                         "timestamp": time.time(),
                     })
                     self._set_run_status(
                         run_id,
                         "cancelled",
+                        session_id=session_id,
                         last_event="run.cancelled",
                     )
                     return
@@ -5055,6 +5115,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})
+                    approval_id = f"approval_{uuid.uuid4().hex}"
                     # Redact credentials from the command before it enters the
                     # SSE/API event stream — same egress bug as #48456, second
                     # transport: API/desktop clients would otherwise receive the
@@ -5066,6 +5127,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     event.update({
                         "event": "approval.request",
                         "run_id": run_id,
+                        "session_id": session_id,
+                        "approval_id": approval_id,
                         "timestamp": time.time(),
                         "choices": _approval_event_choices(
                             smart_denied=bool(event.get("smart_denied")),
@@ -5075,6 +5138,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._set_run_status(
                         run_id,
                         "waiting_for_approval",
+                        session_id=session_id,
+                        approval_id=approval_id,
                         last_event="approval.request",
                     )
                     try:
@@ -5141,15 +5206,22 @@ class APIServerAdapter(BasePlatformAdapter):
                         return r, u
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                effective_session_id = session_id
+                if isinstance(result, dict):
+                    candidate_session_id = result.get("session_id")
+                    if isinstance(candidate_session_id, str) and candidate_session_id:
+                        effective_session_id = candidate_session_id
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
                         "run_id": run_id,
+                        "session_id": effective_session_id,
                         "timestamp": time.time(),
                     })
                     self._set_run_status(
                         run_id,
                         "cancelled",
+                        session_id=effective_session_id,
                         last_event="run.cancelled",
                     )
                 # Check for structured failure (non-retryable client errors like
@@ -5160,12 +5232,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     _put_event_if_active({
                         "event": "run.failed",
                         "run_id": run_id,
+                        "session_id": effective_session_id,
                         "timestamp": time.time(),
                         "error": error_msg,
                     })
                     self._set_run_status(
                         run_id,
                         "failed",
+                        session_id=effective_session_id,
                         error=error_msg,
                         last_event="run.failed",
                     )
@@ -5177,24 +5251,28 @@ class APIServerAdapter(BasePlatformAdapter):
                         "timestamp": time.time(),
                         "output": final_response,
                         "usage": usage,
+                        "session_id": effective_session_id,
                     })
                     self._set_run_status(
                         run_id,
                         "completed",
                         output=final_response,
                         usage=usage,
+                        session_id=effective_session_id,
                         last_event="run.completed",
                     )
             except asyncio.CancelledError:
                 self._set_run_status(
                     run_id,
                     "cancelled",
+                    session_id=session_id,
                     last_event="run.cancelled",
                 )
                 try:
                     _put_event_if_active({
                         "event": "run.cancelled",
                         "run_id": run_id,
+                        "session_id": session_id,
                         "timestamp": time.time(),
                     })
                 except Exception:
@@ -5205,6 +5283,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._set_run_status(
                     run_id,
                     "failed",
+                    session_id=session_id,
                     error=_redact_api_error_text(exc),
                     last_event="run.failed",
                 )
@@ -5212,6 +5291,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     _put_event_if_active({
                         "event": "run.failed",
                         "run_id": run_id,
+                        "session_id": session_id,
                         "timestamp": time.time(),
                         "error": _redact_api_error_text(exc),
                     })
@@ -5253,7 +5333,7 @@ class APIServerAdapter(BasePlatformAdapter):
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
         )
         return web.json_response(
-            {"run_id": run_id, "status": "started"},
+            {"run_id": run_id, "status": "started", "session_id": session_id},
             status=202,
             headers=response_headers,
         )
@@ -5345,6 +5425,13 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
         raw_choice = str(body.get("choice", "")).strip().lower()
+        provided_approval_id = str(body.get("approval_id", "")).strip()
+        expected_approval_id = str(status.get("approval_id") or "")
+        if provided_approval_id and provided_approval_id != expected_approval_id:
+            return web.json_response(
+                _openai_error("Approval ID does not match the pending run approval", code="approval_id_mismatch"),
+                status=409,
+            )
         aliases = {"approve": "once", "approved": "once", "allow": "once"}
         choice = aliases.get(raw_choice, raw_choice)
         allowed = {"once", "session", "always", "deny"}
@@ -5392,7 +5479,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        self._set_run_status(run_id, "running", last_event="approval.responded")
+        self._set_run_status(run_id, "running", approval_id=None, last_event="approval.responded")
         q = self._run_streams.get(run_id)
         if q is not None:
             try:

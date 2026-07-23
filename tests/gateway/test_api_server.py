@@ -4465,6 +4465,15 @@ class TestModelRoutesParsing:
         )
         assert adapter._model_routes["a"] == {"model": "m", "provider": "p"}
 
+    def test_route_accepts_reasoning_effort(self):
+        adapter = _make_routing_adapter(
+            {"background": {"model": "gpt-5.6-terra", "reasoning_effort": "medium"}}
+        )
+        assert adapter._model_routes["background"] == {
+            "model": "gpt-5.6-terra",
+            "reasoning_effort": "medium",
+        }
+
     def test_resolve_route_lookup(self):
         adapter = _make_routing_adapter({"minimax-m2": {"model": "minimax/minimax-m1"}})
         assert adapter._resolve_route("minimax-m2") == {"model": "minimax/minimax-m1"}
@@ -4571,6 +4580,40 @@ class TestModelRoutesHandlers:
 
 
 class TestModelRoutesAgentCreation:
+    def test_route_overrides_reasoning_without_changing_global_config(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        global_reasoning = {"enabled": True, "effort": "xhigh"}
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(lambda model="": global_reasoning),
+        )
+        adapter = _make_routing_adapter({
+            "background": {
+                "model": "gpt-5.6-terra",
+                "provider": "openai-codex",
+                "reasoning_effort": "medium",
+            }
+        })
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+            lambda provider: {"provider": provider},
+        )
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+        adapter._create_agent(
+            session_id="s1", route=adapter._resolve_route("background")
+        )
+
+        assert captured["reasoning_config"] == {"enabled": True, "effort": "medium"}
+        assert global_reasoning == {"enabled": True, "effort": "xhigh"}
+
     def test_route_overrides_model_and_credentials(self, monkeypatch):
         captured = {}
 

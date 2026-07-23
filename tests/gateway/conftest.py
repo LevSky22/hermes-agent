@@ -184,6 +184,21 @@ def _ensure_discord_mock() -> None:
             self.description = description
     discord_mod.SelectOption = _FakeSelectOption
 
+    # A concrete base is required by response-scoped Realtime PCM sources.
+    # MagicMock auto-attributes would turn read()/is_opus() into mocks and
+    # invalidate the audio-source behavior tests.
+    class _FakeAudioSource:
+        def is_opus(self):
+            return False
+
+        def read(self):
+            return b"\x00" * 3840
+
+        def cleanup(self):
+            pass
+
+    discord_mod.AudioSource = _FakeAudioSource
+
     discord_mod.ui = SimpleNamespace(
         View=_FakeView,
         Select=_FakeSelect,
@@ -464,4 +479,3 @@ def pytest_configure(config):
             raise pytest.UsageError(msg)
         else:
             cache_file.write_text("clean", encoding="utf-8")
-
