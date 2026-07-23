@@ -415,6 +415,35 @@ Otherwise, report the issue.
 
 Failed jobs always deliver regardless of the `[SILENT]` marker — only successful runs can be silenced. For quiet monitoring jobs, prompt the agent to reply with only `[SILENT]` when there is nothing to report.
 
+### Pause after the first alert
+
+Polling watchers often need to stop after the first match. Set
+`pause_after_delivery=True` instead of asking the scheduled agent to pause its
+own job:
+
+```python
+cronjob(
+    action="create",
+    name="Contract reply watcher",
+    schedule="every 30m",
+    prompt=(
+        "Check for the specified reply. Return exactly [SILENT] when it has "
+        "not arrived; otherwise summarize the reply."
+    ),
+    pause_after_delivery=True,
+)
+```
+
+The scheduler atomically pauses the job after its first successful, non-silent
+external delivery. Silent checks, failed runs, failed deliveries, and runs with
+no external target remain scheduled. This lifecycle belongs to the scheduler:
+cron-run sessions intentionally cannot access the `cronjob` tool, so a prompt
+that tells a scheduled agent to call `cronjob(action="pause")` cannot work.
+
+The standalone CLI exposes the same policy through
+`--pause-after-delivery`; use `--keep-running-after-delivery` when editing a job
+to disable it.
+
 ## Script timeout
 
 Pre-run scripts (attached via the `script` parameter) have a default timeout of 3600 seconds (1 hour). This bounds the **script only** — skill-based / LLM-driven jobs run on a separate inactivity budget and are not capped by this value. If your scripts need a different limit, you can change it:

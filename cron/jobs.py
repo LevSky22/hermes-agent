@@ -1087,6 +1087,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    pause_after_delivery: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1131,6 +1132,10 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        pause_after_delivery: When True, atomically pause a recurring job after
+                its first successful, non-silent external delivery. This is the
+                supported watcher lifecycle; cron-spawned agents cannot manage
+                cron jobs themselves because the cronjob toolset is disabled.
 
     Returns:
         The created job dict
@@ -1252,6 +1257,7 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
+        "pause_after_delivery": bool(pause_after_delivery),
     }
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
@@ -1513,7 +1519,8 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 pause_reason: Optional[str] = None):
     """
     Mark a job as having been run.
     
@@ -1522,6 +1529,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+
+    ``pause_reason`` atomically records a scheduler-owned terminal watcher
+    transition in the same locked write as the run result. Callers must only
+    provide it after a successful, non-silent external delivery.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -1600,6 +1611,12 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         job["state"] = "completed"
                 elif job.get("state") != "paused":
                     job["state"] = "scheduled"
+
+                if pause_reason and success and delivery_error is None:
+                    job["enabled"] = False
+                    job["state"] = "paused"
+                    job["paused_at"] = now
+                    job["paused_reason"] = str(pause_reason)
 
                 save_jobs(jobs)
                 return

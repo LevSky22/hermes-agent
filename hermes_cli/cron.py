@@ -335,6 +335,7 @@ def cron_create(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        pause_after_delivery=getattr(args, "pause_after_delivery", False) or None,
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -398,6 +399,7 @@ def cron_edit(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", None),
+        pause_after_delivery=getattr(args, "pause_after_delivery", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))

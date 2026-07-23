@@ -621,6 +621,41 @@ class TestMarkJobRun:
         updated = get_job(job["id"])
         assert updated["last_delivery_error"] is None
 
+    def test_pause_reason_is_applied_atomically_with_success(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Watch for one reply",
+            schedule="every 30m",
+            pause_after_delivery=True,
+        )
+
+        mark_job_run(
+            job["id"],
+            success=True,
+            delivery_error=None,
+            pause_reason="Automatically paused after delivery.",
+        )
+
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "ok"
+        assert updated["enabled"] is False
+        assert updated["state"] == "paused"
+        assert updated["paused_at"] == updated["last_run_at"]
+        assert updated["paused_reason"] == "Automatically paused after delivery."
+
+    def test_pause_reason_is_ignored_when_delivery_failed(self, tmp_cron_dir):
+        job = create_job(prompt="Watch", schedule="every 30m")
+
+        mark_job_run(
+            job["id"],
+            success=True,
+            delivery_error="Discord unavailable",
+            pause_reason="Must not pause",
+        )
+
+        updated = get_job(job["id"])
+        assert updated["enabled"] is True
+        assert updated["state"] == "scheduled"
+
     def test_both_agent_and_delivery_error(self, tmp_cron_dir):
         """Agent fails AND delivery fails — both errors recorded."""
         job = create_job(prompt="Report", schedule="every 1h")

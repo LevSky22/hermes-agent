@@ -70,6 +70,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--workdir",
         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
     )
+    cron_create.add_argument(
+        "--pause-after-delivery",
+        action="store_true",
+        help="Pause after the first successful non-silent external delivery (watcher pattern).",
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -133,6 +138,22 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument(
         "--workdir",
         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
+    )
+    pause_group = cron_edit.add_mutually_exclusive_group()
+    pause_group.add_argument(
+        "--pause-after-delivery",
+        dest="pause_after_delivery",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Pause after the first successful non-silent external delivery.",
+    )
+    pause_group.add_argument(
+        "--keep-running-after-delivery",
+        dest="pause_after_delivery",
+        action="store_const",
+        const=False,
+        help="Disable automatic pause after delivery.",
     )
 
     # lifecycle actions
