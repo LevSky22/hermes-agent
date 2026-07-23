@@ -5,6 +5,7 @@ can invoke skills via /skill-name commands.
 """
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -405,6 +406,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
                         "skill_dir": str(skill_md.parent),
+                        "content_sha256": hashlib.sha256(skill_md.read_bytes()).hexdigest(),
                     }
                 except Exception:
                     continue
@@ -460,11 +462,15 @@ def reload_skills() -> Dict[str, Any]:
     # slash-command cache. Using dicts lets the post-rescan diff carry
     # descriptions for newly-visible or just-removed skills without a
     # second disk walk.
-    def _snapshot(cmds: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
-        out: Dict[str, str] = {}
+    def _snapshot(cmds: Dict[str, Dict[str, Any]]) -> Dict[str, tuple[str, str]]:
+        out: Dict[str, tuple[str, str]] = {}
         for slash_key, info in cmds.items():
             bare = slash_key.lstrip("/")
-            out[bare] = (info or {}).get("description") or ""
+            value = info or {}
+            out[bare] = (
+                value.get("description") or "",
+                value.get("content_sha256") or "",
+            )
         return out
 
     before = _snapshot(_skill_commands)
@@ -477,16 +483,20 @@ def reload_skills() -> Dict[str, Any]:
 
     added_names = sorted(set(after) - set(before))
     removed_names = sorted(set(before) - set(after))
-    unchanged = sorted(set(after) & set(before))
+    common = set(after) & set(before)
+    changed_names = sorted(name for name in common if after[name][1] != before[name][1])
+    unchanged = sorted(common - set(changed_names))
 
-    added = [{"name": n, "description": after[n]} for n in added_names]
+    added = [{"name": n, "description": after[n][0]} for n in added_names]
     # For removed skills, use the description we had cached pre-rescan
     # (the skill file is gone so we can't re-read it).
-    removed = [{"name": n, "description": before[n]} for n in removed_names]
+    removed = [{"name": n, "description": before[n][0]} for n in removed_names]
+    changed = [{"name": n, "description": after[n][0]} for n in changed_names]
 
     return {
         "added": added,
         "removed": removed,
+        "changed": changed,
         "unchanged": unchanged,
         "total": len(after),
         "commands": len(new_commands),

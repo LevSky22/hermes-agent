@@ -11,8 +11,10 @@ FROM debian:13.4
 
 ARG HERMES_VERSION=custom-local
 ARG HERMES_COMMIT=unknown
+ARG HERMES_IMAGE_TITLE=hermes-agent-fortuna-ops
+ARG HERMES_WRITE_SAFE_ROOTS=/opt/data:/srv/vault:/srv/code/internal:/srv/code/shared:/tmp
 
-LABEL org.opencontainers.image.title="hermes-agent-fortuna-ops" \
+LABEL org.opencontainers.image.title="${HERMES_IMAGE_TITLE}" \
       org.opencontainers.image.version="${HERMES_VERSION}" \
       org.opencontainers.image.revision="${HERMES_COMMIT}"
 
@@ -195,6 +197,7 @@ RUN uv pip install --no-cache-dir \
         google-auth-httplib2 \
         google-auth-oauthlib \
         jinja2 \
+        numpy==2.4.3 \
         openpyxl \
         pdf2image \
         pdfplumber \
@@ -322,7 +325,7 @@ ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 # check. (A separate launcher hardening is tracked independently.)
 ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
 ENV HERMES_HOME=/opt/data
-ENV HERMES_WRITE_SAFE_ROOT=/opt/data:/srv/vault:/srv/code/internal:/srv/code/shared:/tmp
+ENV HERMES_WRITE_SAFE_ROOT=${HERMES_WRITE_SAFE_ROOTS}
 ENV HERMES_DISABLE_LAZY_INSTALLS=1
 # The published image seals /opt/hermes (root-owned, read-only) so a runtime
 # lazy install can't mutate the agent's own venv and brick it. But opt-in

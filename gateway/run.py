@@ -23232,6 +23232,34 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     def restart_signal_handler():
         runner.request_restart(detached=False, via_service=True)
+
+    async def reload_skills_signal_handler_async():
+        """Refresh skill catalogs and Discord autocomplete without a restart."""
+        try:
+            from agent.skill_commands import reload_skills
+
+            result = await asyncio.get_running_loop().run_in_executor(None, reload_skills)
+            adapter_sets = [runner.adapters, *runner._profile_adapters.values()]
+            for adapters in adapter_sets:
+                for adapter in list(adapters.values()):
+                    refresh = getattr(adapter, "refresh_skill_group", None)
+                    if not callable(refresh):
+                        continue
+                    maybe = refresh()
+                    if inspect.isawaitable(maybe):
+                        await maybe
+            logger.info(
+                "SIGUSR2 skill reload complete: added=%s changed=%s removed=%s total=%s",
+                [item["name"] for item in result.get("added", [])],
+                [item["name"] for item in result.get("changed", [])],
+                [item["name"] for item in result.get("removed", [])],
+                result.get("total", 0),
+            )
+        except Exception:
+            logger.exception("SIGUSR2 skill reload failed")
+
+    def reload_skills_signal_handler():
+        asyncio.create_task(reload_skills_signal_handler_async())
     
     loop = asyncio.get_running_loop()
 
@@ -23258,6 +23286,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if hasattr(signal, "SIGUSR1"):
             try:
                 loop.add_signal_handler(signal.SIGUSR1, restart_signal_handler)  # windows-footgun: ok — POSIX signal, guarded by hasattr above + try/except NotImplementedError
+            except NotImplementedError:
+                pass
+        if hasattr(signal, "SIGUSR2"):
+            try:
+                loop.add_signal_handler(signal.SIGUSR2, reload_skills_signal_handler)
             except NotImplementedError:
                 pass
     else:

@@ -2633,7 +2633,7 @@ class GatewaySlashCommandsMixin:
         return t("gateway.set_home.success", name=chat_name, chat_id=chat_id)
 
     async def _handle_voice_command(self, event: MessageEvent) -> str:
-        """Handle /voice [on|off|tts|channel|leave|status] command."""
+        """Handle classic and delegated Realtime Discord voice modes."""
         args = event.get_command_args().strip().lower()
         chat_id = event.source.chat_id
         platform = event.source.platform
@@ -2659,12 +2659,73 @@ class GatewaySlashCommandsMixin:
             if adapter:
                 self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
             return t("gateway.voice.tts_enabled")
+        elif args == "realtime":
+            if platform != Platform.DISCORD or adapter is None:
+                return "Realtime voice is currently available only on Discord."
+            joined = await self._handle_voice_channel_join(event)
+            guild_id = self._get_guild_id(event)
+            if not guild_id or not hasattr(adapter, "start_realtime_voice"):
+                return "Realtime voice is not available in this Discord build."
+            if not hasattr(adapter, "is_in_voice_channel") or not adapter.is_in_voice_channel(guild_id):
+                return joined
+            try:
+                await adapter.start_realtime_voice(
+                    guild_id,
+                    user_id=int(event.source.user_id),
+                    text_channel_id=int(event.source.chat_id),
+                )
+            except Exception as exc:
+                logger.warning("Failed to enable Discord Realtime voice: %s", exc, exc_info=True)
+                return f"Joined the voice channel, but Realtime could not start: {exc}"
+            # Realtime owns output audio. Disable the classic post-turn TTS
+            # route so one utterance cannot produce two spoken responses.
+            self._voice_mode[voice_key] = "off"
+            self._save_voice_modes()
+            self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
+            return (
+                "Realtime voice is connected. I can chat directly and will "
+                "delegate operational work to Hermes in the background."
+            )
         elif args in {"channel", "join"}:
+            guild_id = self._get_guild_id(event)
+            if guild_id and adapter and hasattr(adapter, "stop_realtime_voice"):
+                await adapter.stop_realtime_voice(guild_id)
             return await self._handle_voice_channel_join(event)
+        elif args == "pause":
+            guild_id = self._get_guild_id(event)
+            realtime = getattr(adapter, "_realtime_voice_sessions", {}).get(guild_id) if guild_id else None
+            if realtime is None:
+                return "Realtime voice is not active."
+            realtime.pause()
+            return "Realtime listening paused."
+        elif args == "resume":
+            guild_id = self._get_guild_id(event)
+            realtime = getattr(adapter, "_realtime_voice_sessions", {}).get(guild_id) if guild_id else None
+            if realtime is None:
+                return "Realtime voice is not active."
+            realtime.resume()
+            return "Realtime listening resumed."
         elif args == "leave":
             return await self._handle_voice_channel_leave(event)
         elif args == "status":
             mode = self._voice_mode.get(voice_key, "off")
+            guild_id = self._get_guild_id(event)
+            realtime_status = (
+                adapter.realtime_voice_status(guild_id)
+                if guild_id and adapter and hasattr(adapter, "realtime_voice_status")
+                else None
+            )
+            if realtime_status:
+                state = "paused" if realtime_status["paused"] else (
+                    "connected" if realtime_status["connected"] else "reconnecting"
+                )
+                detail = (
+                    f"Realtime voice: **{state}** · `{realtime_status['model']}` "
+                    f"· voice `{realtime_status['voice']}`"
+                )
+                if realtime_status.get("last_error"):
+                    detail += f"\nLast error: {realtime_status['last_error']}"
+                return detail
             labels = {
                 "off": t("gateway.voice.label_off"),
                 "voice_only": t("gateway.voice.label_voice_only"),

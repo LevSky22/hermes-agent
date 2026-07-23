@@ -11,7 +11,7 @@ Covers:
 import asyncio
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -209,6 +209,58 @@ class TestStartRun:
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 assert resp.status == 202
+
+    @pytest.mark.asyncio
+    async def test_resume_session_loads_canonical_history_and_reports_rotation(self, adapter):
+        app = _create_runs_app(adapter)
+        session_db = MagicMock()
+        session_db.resolve_resume_session_id.return_value = "session-current"
+        history = [{"role": "user", "content": "earlier"}, {"role": "assistant", "content": "noted"}]
+        with (
+            patch.object(adapter, "_get_existing_session_or_404", AsyncMock(return_value=({"id": "session-old"}, None))),
+            patch.object(adapter, "_ensure_session_db_async", AsyncMock(return_value=session_db)),
+            patch.object(adapter, "_conversation_history_for_session", AsyncMock(return_value=history)),
+            patch.object(adapter, "_create_agent") as mock_create,
+        ):
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "done",
+                "session_id": "session-after-compression",
+            }
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            mock_create.return_value = mock_agent
+
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "continue", "session_id": "session-old", "resume_session": True},
+                )
+                assert response.status == 202
+                started = await response.json()
+                assert started["session_id"] == "session-current"
+
+                for _ in range(40):
+                    polled = await cli.get(f"/v1/runs/{started['run_id']}")
+                    status = await polled.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.025)
+
+        mock_agent.run_conversation.assert_called_once()
+        assert mock_agent.run_conversation.call_args.kwargs["conversation_history"] == history
+        assert status["session_id"] == "session-after-compression"
+
+    @pytest.mark.asyncio
+    async def test_resume_session_requires_explicit_session_id(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs",
+                json={"input": "continue", "resume_session": True},
+            )
+        assert response.status == 400
 
 
 # ---------------------------------------------------------------------------
