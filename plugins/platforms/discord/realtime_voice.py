@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import audioop
 import base64
 import json
 import logging
+import sys
 import time
+from array import array
 from collections import deque
 from typing import Any, Awaitable, Callable, Optional
 
@@ -32,43 +35,41 @@ choice requires a separate second confirmation with the exact words
 
 def pcm_48k_stereo_to_24k_mono(pcm: bytes) -> bytes:
     """Downsample Discord s16le 48 kHz stereo PCM to 24 kHz mono."""
+    pcm = pcm[: len(pcm) - (len(pcm) % 4)]
     if not pcm:
         return b""
-    import numpy as np
-
-    samples = np.frombuffer(pcm[: len(pcm) - (len(pcm) % 4)], dtype="<i2")
-    if not samples.size:
-        return b""
-    stereo = samples.reshape(-1, 2).astype(np.int32)
-    mono = ((stereo[:, 0] + stereo[:, 1]) // 2).astype("<i2")
-    return mono[::2].tobytes()
+    mono = audioop.tomono(pcm, 2, 0.5, 0.5)
+    samples = array("h")
+    samples.frombytes(mono)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    converted = samples[::2]
+    if sys.byteorder != "little":
+        converted.byteswap()
+    return converted.tobytes()
 
 
 def pcm_24k_mono_to_48k_stereo(pcm: bytes) -> bytes:
     """Upsample OpenAI s16le 24 kHz mono PCM to Discord 48 kHz stereo."""
+    pcm = pcm[: len(pcm) - (len(pcm) % 2)]
     if not pcm:
         return b""
-    import numpy as np
-
-    mono = np.frombuffer(pcm[: len(pcm) - (len(pcm) % 2)], dtype="<i2")
-    if not mono.size:
-        return b""
-    doubled = np.repeat(mono, 2)
-    stereo = np.column_stack((doubled, doubled)).astype("<i2", copy=False)
-    return stereo.tobytes()
+    mono = array("h")
+    mono.frombytes(pcm)
+    if sys.byteorder != "little":
+        mono.byteswap()
+    converted = array("h", (sample for value in mono for sample in (value, value)))
+    if sys.byteorder != "little":
+        converted.byteswap()
+    return audioop.tostereo(converted.tobytes(), 2, 1.0, 1.0)
 
 
 def pcm_rms(pcm: bytes) -> float:
     """Return RMS amplitude for little-endian signed 16-bit PCM."""
+    pcm = pcm[: len(pcm) - (len(pcm) % 2)]
     if not pcm:
         return 0.0
-    import numpy as np
-
-    samples = np.frombuffer(pcm[: len(pcm) - (len(pcm) % 2)], dtype="<i2")
-    if not samples.size:
-        return 0.0
-    values = samples.astype(np.float64)
-    return float(np.sqrt(np.mean(values * values)))
+    return float(audioop.rms(pcm, 2))
 
 
 class DiscordRealtimeSession:

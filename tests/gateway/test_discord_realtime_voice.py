@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from array import array
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,8 +27,7 @@ def test_realtime_exposes_exactly_five_narrow_tools():
 
 
 def test_pcm_conversion_preserves_duration_and_channels():
-    np = pytest.importorskip("numpy")
-    discord_pcm = np.arange(480 * 2, dtype=np.int16).tobytes()
+    discord_pcm = array("h", range(480 * 2)).tobytes()
     realtime_pcm = pcm_48k_stereo_to_24k_mono(discord_pcm)
     assert len(realtime_pcm) == 240 * 2
     round_trip = pcm_24k_mono_to_48k_stereo(realtime_pcm)
@@ -35,14 +35,12 @@ def test_pcm_conversion_preserves_duration_and_channels():
 
 
 def test_pcm_rms_distinguishes_silence_and_speech():
-    np = pytest.importorskip("numpy")
     assert pcm_rms(b"\x00\x00" * 240) == 0
-    assert pcm_rms(np.full(240, 1000, dtype=np.int16).tobytes()) == 1000
+    assert pcm_rms(array("h", [1000] * 240).tobytes()) == 1000
 
 
 @pytest.mark.asyncio
 async def test_realtime_filters_silence_and_manually_finalizes_turn():
-    np = pytest.importorskip("numpy")
     session = DiscordRealtimeSession(
         api_key="key",
         broker=MagicMock(),
@@ -55,7 +53,7 @@ async def test_realtime_filters_silence_and_manually_finalizes_turn():
     await asyncio.sleep(0)
     assert session._input.empty()
 
-    speech = np.full(960, 1000, dtype=np.int16).tobytes()
+    speech = array("h", [1000] * 960).tobytes()
     session.feed_discord_pcm(1, speech)
     await asyncio.sleep(0.14)
     sent = [json.loads(call.args[0]) for call in session._ws.send.await_args_list]
