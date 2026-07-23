@@ -298,6 +298,7 @@ class HermesRunBroker:
         self._pump_lock = asyncio.Lock()
         self._always_challenges: dict[tuple[str, str], tuple[float, bool]] = {}
         self._progress_sequences: dict[str, int] = {}
+        self._last_status_checks: dict[str, float] = {}
         self._closed = False
 
     async def start(self) -> None:
@@ -389,6 +390,7 @@ class HermesRunBroker:
         task = self._owned(task_id)
         if task is None:
             return {"ok": False, "error": "task_not_found"}
+        self._last_status_checks[task_id] = time.monotonic()
         return self._public(task)
 
     async def followup(self, task_id: str, request: str) -> dict[str, Any]:
@@ -547,6 +549,9 @@ class HermesRunBroker:
 
     async def _notify_progress(self, task_id: str) -> None:
         if self.status_callback is None:
+            return
+        last_status_check = self._last_status_checks.get(task_id, 0.0)
+        if time.monotonic() - last_status_check < self.progress_interval_seconds:
             return
         task = self._owned(task_id)
         if task is None or task["status"] != "running":

@@ -356,19 +356,18 @@ class DiscordRealtimeSession:
             maxlen=20,
         )
 
-        short_id = task_id[-8:]
         if status == "running":
-            update = f"Internal work {short_id} is still in progress. {progress}"
+            update = f"The requested work is still in progress. {progress}"
         elif status == "completed":
             detail = str(task.get("output") or "The task completed successfully.")[
                 :1200
             ]
-            update = f"Internal work {short_id} completed. Result: {detail}"
+            update = f"The requested work completed. Result: {detail}"
         elif status == "failed":
             detail = str(
                 task.get("error") or "The task failed without an error message."
             )[:1200]
-            update = f"Internal work {short_id} failed. Error: {detail}"
+            update = f"The requested work failed. Error: {detail}"
         else:
             approval = task.get("approval") or {}
             detail = str(
@@ -377,9 +376,8 @@ class DiscordRealtimeSession:
                 or "The task needs the user's approval before it can continue."
             )[:1200]
             approval_id = str(task.get("approval_id") or "")
-            update = (
-                f"Internal work {short_id} needs approval. {detail}"
-                + (f" Approval ID: {approval_id}." if approval_id else "")
+            update = f"The requested work needs approval. {detail}" + (
+                f" Approval ID: {approval_id}." if approval_id else ""
             )
 
         announcement = (
@@ -778,6 +776,8 @@ class DiscordRealtimeSession:
             args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
         except (json.JSONDecodeError, TypeError, ValueError):
             args = {}
+        if name == "get_hermes_task_status":
+            self._suppress_pending_progress(str(args.get("task_id") or ""))
         result = await self.broker.handle_tool(name, args, call_id)
         await self._send({
             "type": "conversation.item.create",
@@ -791,6 +791,19 @@ class DiscordRealtimeSession:
             return
         self._active_response = True
         await self._send({"type": "response.create"})
+
+    def _suppress_pending_progress(self, task_id: str) -> None:
+        """Drop a redundant heartbeat when the user explicitly asks status."""
+        if not task_id:
+            return
+        self._pending_task_announcements = deque(
+            (
+                pending
+                for pending in self._pending_task_announcements
+                if not (pending[0] == task_id and pending[1] == "running")
+            ),
+            maxlen=20,
+        )
 
     async def _send(self, payload: dict[str, Any]) -> None:
         if self._ws is None:

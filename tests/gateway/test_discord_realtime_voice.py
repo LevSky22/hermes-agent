@@ -414,6 +414,36 @@ async def test_terminal_update_supersedes_queued_progress():
 
 
 @pytest.mark.asyncio
+async def test_explicit_status_call_discards_queued_progress_announcement():
+    broker = MagicMock()
+    broker.handle_tool = AsyncMock(
+        return_value={"ok": True, "task_id": "rtask_12345678", "status": "running"}
+    )
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=broker,
+        audio_callback=lambda _pcm: None,
+    )
+    session._ws = AsyncMock()
+    session._active_response = True
+    await session.notify_task_status({
+        "task_id": "rtask_12345678",
+        "status": "running",
+        "progress": "Still working on it.",
+        "progress_seq": 1,
+    })
+    assert len(session._pending_task_announcements) == 1
+
+    await session._handle_tool_call({
+        "name": "get_hermes_task_status",
+        "call_id": "call_status",
+        "arguments": '{"task_id":"rtask_12345678"}',
+    })
+
+    assert not session._pending_task_announcements
+
+
+@pytest.mark.asyncio
 async def test_task_announcement_waits_for_active_response():
     session = DiscordRealtimeSession(
         api_key="key",
@@ -496,6 +526,41 @@ async def test_broker_emits_sanitized_progress_update(tmp_path):
     assert update["progress"] == "Still working on it."
     assert update["progress_seq"] == 1
     assert "tool" not in update
+
+
+@pytest.mark.asyncio
+async def test_broker_status_check_suppresses_next_progress_heartbeat(tmp_path):
+    callback = AsyncMock()
+    broker = HermesRunBroker(
+        owner_key="owner",
+        api_key="key",
+        store_path=tmp_path / "status-progress.sqlite3",
+        status_callback=callback,
+        progress_interval_seconds=30,
+    )
+    now = time.time()
+    broker.store.put_task({
+        "task_id": "rtask_progress",
+        "owner_key": "owner",
+        "prompt": "do work",
+        "status": "running",
+        "run_id": "run_1",
+        "session_id": "session_1",
+        "output": None,
+        "error": None,
+        "approval_id": None,
+        "approval_json": None,
+        "created_at": now,
+        "updated_at": now,
+    })
+    try:
+        result = await broker.status("rtask_progress")
+        await broker._notify_progress("rtask_progress")
+    finally:
+        await broker.close()
+
+    assert result["status"] == "running"
+    callback.assert_not_awaited()
 
 
 @pytest.mark.asyncio
