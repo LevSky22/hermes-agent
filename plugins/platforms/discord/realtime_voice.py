@@ -262,8 +262,12 @@ class DiscordRealtimeSession:
             "Discord Realtime finalizing input turn after %dms silence",
             self.manual_turn_timeout_ms,
         )
-        await self._send({"type": "input_audio_buffer.commit"})
-        await self._send({"type": "response.create"})
+        try:
+            await self._send({"type": "input_audio_buffer.commit"})
+            await self._send({"type": "response.create"})
+        except Exception as exc:
+            self.last_error = str(exc)
+            logger.warning("Discord Realtime turn finalization failed: %s", exc)
 
     def _clear_input(self) -> None:
         while True:
