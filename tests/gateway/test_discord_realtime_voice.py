@@ -29,6 +29,7 @@ def test_realtime_exposes_only_narrow_bridge_tools():
         "delegate_to_hermes",
         "remember_user_preference",
         "get_hermes_task_status",
+        "set_hermes_task_updates",
         "send_followup_to_hermes",
         "cancel_hermes_task",
         "approve_hermes_action",
@@ -434,6 +435,51 @@ async def test_terminal_update_supersedes_queued_progress():
 
 
 @pytest.mark.asyncio
+async def test_completion_only_control_discards_queued_progress():
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+    )
+    session._ws = AsyncMock()
+    session._active_response = True
+    await session.notify_task_status({
+        "task_id": "rtask_12345678",
+        "status": "running",
+        "progress": "Still working on it.",
+        "progress_seq": 1,
+    })
+    assert len(session._pending_task_announcements) == 1
+
+    await session.notify_task_status({
+        "task_id": "rtask_12345678",
+        "status": "running",
+        "suppress_progress": True,
+    })
+
+    assert not session._pending_task_announcements
+
+
+@pytest.mark.asyncio
+async def test_realtime_identity_context_can_refresh_in_place():
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+        identity_context="old user profile",
+    )
+    session._ws = AsyncMock()
+    session._connected.set()
+
+    await session.refresh_identity_context("new USER.md preference")
+
+    event = json.loads(session._ws.send.await_args.args[0])
+    assert event["type"] == "session.update"
+    assert "new USER.md preference" in event["session"]["instructions"]
+    assert "old user profile" not in event["session"]["instructions"]
+
+
+@pytest.mark.asyncio
 async def test_explicit_status_call_discards_queued_progress_announcement():
     broker = MagicMock()
     broker.handle_tool = AsyncMock(
@@ -546,6 +592,78 @@ async def test_broker_emits_sanitized_progress_update(tmp_path):
     assert update["progress"] == "Still working on it."
     assert update["progress_seq"] == 1
     assert "tool" not in update
+
+
+@pytest.mark.asyncio
+async def test_broker_progress_is_completion_only_by_default_and_opt_in(tmp_path):
+    callback = AsyncMock()
+    broker = HermesRunBroker(
+        owner_key="owner",
+        api_key="key",
+        store_path=tmp_path / "progress-mode.sqlite3",
+        status_callback=callback,
+    )
+    now = time.time()
+    broker.store.put_task({
+        "task_id": "rtask_progress_mode",
+        "owner_key": "owner",
+        "prompt": "do work",
+        "status": "running",
+        "run_id": "run_1",
+        "session_id": "session_1",
+        "output": None,
+        "error": None,
+        "approval_id": None,
+        "approval_json": None,
+        "created_at": now,
+        "updated_at": now,
+    })
+    try:
+        assert broker.store.get("rtask_progress_mode")["progress_enabled"] == 0
+        enabled = await broker.set_updates("rtask_progress_mode", "periodic")
+        assert enabled["mode"] == "periodic"
+        assert broker.store.get("rtask_progress_mode")["progress_enabled"] == 1
+        disabled = await broker.set_updates(
+            "rtask_progress_mode", "completion_only"
+        )
+        assert disabled["mode"] == "completion_only"
+        assert broker.store.get("rtask_progress_mode")["progress_enabled"] == 0
+    finally:
+        await broker.close()
+    callback.assert_awaited_once()
+    assert callback.await_args.args[0]["suppress_progress"] is True
+
+
+@pytest.mark.asyncio
+async def test_broker_routes_background_runs_through_configured_model(tmp_path):
+    broker = HermesRunBroker(
+        owner_key="owner",
+        api_key="key",
+        store_path=tmp_path / "background-model.sqlite3",
+        background_model="realtime-background",
+    )
+    now = time.time()
+    broker.store.put_task({
+        "task_id": "rtask_model",
+        "owner_key": "owner",
+        "prompt": "read one record",
+        "status": "queued",
+        "run_id": None,
+        "session_id": None,
+        "output": None,
+        "error": None,
+        "approval_id": None,
+        "approval_json": None,
+        "created_at": now,
+        "updated_at": now,
+    })
+    broker._request = AsyncMock(return_value={"error": "stop after capture"})
+    try:
+        await broker._run_task("rtask_model")
+    finally:
+        await broker.close()
+    payload = broker._request.await_args.args[2]
+    assert payload["model"] == "realtime-background"
 
 
 @pytest.mark.asyncio

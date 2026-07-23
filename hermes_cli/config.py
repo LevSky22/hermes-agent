@@ -2619,6 +2619,7 @@ DEFAULT_CONFIG = {
             "manual_turn_timeout_ms": 700,
             "max_active_tasks": 2,
             "max_queued_tasks": 5,
+            "background_model": "",
             "api_server_url": "http://127.0.0.1:8642",
         },
     },

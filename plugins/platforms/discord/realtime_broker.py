@@ -74,6 +74,26 @@ REALTIME_TOOLS: list[dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "set_hermes_task_updates",
+        "description": (
+            "Change spoken progress updates for one active background task. "
+            "Tasks announce completion, failure, and approvals regardless of this setting."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["periodic", "completion_only"],
+                },
+            },
+            "required": ["task_id", "mode"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
         "name": "send_followup_to_hermes",
         "description": "Continue a completed or active background task in the same persisted session.",
         "parameters": {
@@ -157,6 +177,7 @@ class RealtimeTaskStore:
                 error TEXT,
                 approval_id TEXT,
                 approval_json TEXT,
+                progress_enabled INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
@@ -170,6 +191,14 @@ class RealtimeTaskStore:
             );
             """
         )
+        columns = {
+            str(row["name"])
+            for row in self._db.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        if "progress_enabled" not in columns:
+            self._db.execute(
+                "ALTER TABLE tasks ADD COLUMN progress_enabled INTEGER NOT NULL DEFAULT 0"
+            )
         # A process restart cannot prove an old HTTP run is still attached to
         # this broker. Re-queue it and let the API/session contract resume it.
         self._db.execute(
@@ -184,11 +213,12 @@ class RealtimeTaskStore:
         self._db.close()
 
     def put_task(self, task: dict[str, Any]) -> None:
+        task = {**task, "progress_enabled": int(bool(task.get("progress_enabled", 0)))}
         self._db.execute(
             """INSERT OR REPLACE INTO tasks
                (task_id,owner_key,prompt,status,run_id,session_id,output,error,
-                approval_id,approval_json,created_at,updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                approval_id,approval_json,progress_enabled,created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             tuple(
                 task.get(k)
                 for k in (
@@ -202,6 +232,7 @@ class RealtimeTaskStore:
                     "error",
                     "approval_id",
                     "approval_json",
+                    "progress_enabled",
                     "created_at",
                     "updated_at",
                 )
@@ -220,6 +251,7 @@ class RealtimeTaskStore:
             "error",
             "approval_id",
             "approval_json",
+            "progress_enabled",
             "updated_at",
         }
         values = {k: v for k, v in fields.items() if k in allowed}
@@ -280,7 +312,7 @@ class RealtimeTaskStore:
 
 
 class HermesRunBroker:
-    """Execute the five Realtime operations against loopback ``/v1/runs``."""
+    """Execute the narrow Realtime operations against loopback ``/v1/runs``."""
 
     TERMINAL = frozenset({"completed", "failed", "cancelled"})
 
@@ -295,6 +327,7 @@ class HermesRunBroker:
         max_queued: int = 5,
         progress_after_seconds: float = 12.0,
         progress_interval_seconds: float = 30.0,
+        background_model: Optional[str] = None,
         status_callback: Optional[StatusCallback] = None,
     ):
         self.owner_key = owner_key
@@ -306,6 +339,7 @@ class HermesRunBroker:
         self.progress_interval_seconds = max(
             10.0, float(progress_interval_seconds)
         )
+        self.background_model = str(background_model or "").strip() or None
         self.status_callback = status_callback
         self.store = RealtimeTaskStore(store_path)
         self._http: Optional[aiohttp.ClientSession] = None
@@ -343,6 +377,7 @@ class HermesRunBroker:
             "delegate_to_hermes": self.delegate,
             "remember_user_preference": self.remember_user_preference,
             "get_hermes_task_status": self.status,
+            "set_hermes_task_updates": self.set_updates,
             "send_followup_to_hermes": self.followup,
             "cancel_hermes_task": self.cancel,
             "approve_hermes_action": self.approve,
@@ -409,6 +444,7 @@ class HermesRunBroker:
             "error": None,
             "approval_id": None,
             "approval_json": None,
+            "progress_enabled": 0,
             "created_at": now,
             "updated_at": now,
         })
@@ -426,6 +462,31 @@ class HermesRunBroker:
         if task is None:
             return {"ok": False, "error": "task_not_found"}
         return self._public(task)
+
+    async def set_updates(self, task_id: str, mode: str) -> dict[str, Any]:
+        """Enable or suppress periodic progress for one owned active task."""
+        task = self._owned(task_id)
+        if task is None:
+            return {"ok": False, "error": "task_not_found"}
+        if task["status"] in self.TERMINAL:
+            return {"ok": False, "error": "task_not_active", "status": task["status"]}
+        mode = str(mode or "").strip().lower()
+        if mode not in {"periodic", "completion_only"}:
+            return {"ok": False, "error": "invalid_update_mode"}
+        enabled = mode == "periodic"
+        self.store.update(task_id, progress_enabled=int(enabled))
+        if not enabled and self.status_callback is not None:
+            try:
+                await self.status_callback({
+                    "task_id": task_id,
+                    "status": task["status"],
+                    "suppress_progress": True,
+                })
+            except Exception:
+                logger.exception(
+                    "Realtime progress suppression callback failed for %s", task_id
+                )
+        return {"ok": True, "task_id": task_id, "mode": mode}
 
     async def followup(self, task_id: str, request: str) -> dict[str, Any]:
         task = self._owned(task_id)
@@ -548,6 +609,8 @@ class HermesRunBroker:
             "input": task["prompt"],
             "session_id": task.get("session_id") or task_id,
         }
+        if self.background_model:
+            payload["model"] = self.background_model
         if task.get("session_id"):
             payload["resume_session"] = True
         started = await self._request("POST", "/v1/runs", payload)
@@ -577,7 +640,7 @@ class HermesRunBroker:
             task = self._owned(task_id)
             if task is None or task["status"] in self.TERMINAL:
                 return
-            if task["status"] == "running":
+            if task["status"] == "running" and bool(task.get("progress_enabled")):
                 await self._notify_progress(task_id)
             await asyncio.sleep(self.progress_interval_seconds)
 

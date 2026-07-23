@@ -1034,6 +1034,7 @@ class APIServerAdapter(BasePlatformAdapter):
         #       api_key: "sk-…"          # optional — per-route UPSTREAM provider
         #                                # key override (NOT caller auth; never logged)
         #       base_url: "https://…"    # optional — per-route base URL override
+        #       reasoning_effort: "medium"  # optional — per-route override
         self._model_routes: Dict[str, Dict[str, Any]] = self._parse_model_routes(
             extra.get("model_routes"),
         )
@@ -1751,7 +1752,8 @@ class APIServerAdapter(BasePlatformAdapter):
     def _parse_model_routes(raw: Any) -> Dict[str, Dict[str, Any]]:
         """Validate and normalize the ``model_routes`` config block.
 
-        Accepts a mapping of ``alias -> {model, provider?, api_key?, base_url?}``.
+        Accepts a mapping of ``alias -> {model, provider?, api_key?, base_url?,
+        reasoning_effort?}``.
         Invalid shapes are dropped (never raised) so a config typo can't take
         the whole API server down.  Route values are coerced to strings.
 
@@ -1770,7 +1772,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             return {}
 
-        allowed_keys = ("model", "provider", "api_key", "base_url")
+        allowed_keys = (
+            "model",
+            "provider",
+            "api_key",
+            "base_url",
+            "reasoning_effort",
+        )
         routes: Dict[str, Dict[str, Any]] = {}
         for alias, cfg in raw.items():
             alias_str = str(alias).strip()
@@ -1911,6 +1919,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 runtime_kwargs["api_key"] = route["api_key"]
             if route.get("base_url"):
                 runtime_kwargs["base_url"] = route["base_url"]
+            if route.get("reasoning_effort"):
+                effort = route["reasoning_effort"].lower()
+                if effort in {
+                    "none", "minimal", "low", "medium", "high", "xhigh",
+                    "max", "ultra",
+                }:
+                    reasoning_config = (
+                        {"enabled": False}
+                        if effort == "none"
+                        else {"enabled": True, "effort": effort}
+                    )
+                else:
+                    logger.warning(
+                        "api_server model route has invalid reasoning_effort for model=%s",
+                        model,
+                    )
             logger.debug(
                 "api_server model route applied: model=%s provider=%s",
                 model,

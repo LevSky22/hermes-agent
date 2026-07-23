@@ -50,6 +50,11 @@ task IDs, or other implementation details.
 - For personal, current, operational, company-system, factual, or consequential
   requests, call delegate_to_hermes silently when intent is clear.
 - Use send_followup_to_hermes only when the user is continuing the same work.
+- Background work is completion-only by default: announce completion, failure,
+  and approvals, but do not give periodic progress unless the user explicitly
+  asks to be kept posted. Use set_hermes_task_updates with periodic for that
+  active task. If the user asks to stop updates or only tell them when it is
+  done, set that task back to completion_only.
 - Keep task and approval identifiers internal.
 - Do not invent results or claim work succeeded before a successful work update.
 - If work fails, explain it briefly in user-friendly language and offer one next step.
@@ -215,12 +220,8 @@ class DiscordRealtimeSession:
         self.vad_prefix_ms = max(0, int(vad_prefix_ms))
         self.vad_silence_ms = max(100, int(vad_silence_ms))
         self.input_silence_threshold = max(0, int(input_silence_threshold))
-        identity_context = str(identity_context or "").strip()
-        self.instructions = (
-            identity_context
-            + ("\n\n# Realtime voice interaction contract\n\n" if identity_context else "")
-            + instructions
-        )
+        self._voice_contract = str(instructions or DEFAULT_INSTRUCTIONS)
+        self.instructions = self._compose_instructions(identity_context)
         self.history_turns = max(4, int(history_turns))
         self.session_rotation_seconds = max(300, int(session_rotation_seconds))
         # Forty-millisecond chunks, bounded to two seconds. Socket-thread
@@ -258,6 +259,23 @@ class DiscordRealtimeSession:
     @property
     def paused(self) -> bool:
         return self._paused
+
+    def _compose_instructions(self, identity_context: str) -> str:
+        identity_context = str(identity_context or "").strip()
+        return (
+            identity_context
+            + ("\n\n# Realtime voice interaction contract\n\n" if identity_context else "")
+            + self._voice_contract
+        )
+
+    async def refresh_identity_context(self, identity_context: str) -> None:
+        """Refresh SOUL/MEMORY/USER context without restarting voice."""
+        instructions = self._compose_instructions(identity_context)
+        if instructions == self.instructions:
+            return
+        self.instructions = instructions
+        if self._ws is not None and self.connected:
+            await self._send(self._session_update())
 
     async def start(self) -> None:
         if self._runner and not self._runner.done():
@@ -320,6 +338,19 @@ class DiscordRealtimeSession:
 
     async def notify_task_status(self, task: dict[str, Any]) -> None:
         """Queue important Hermes task transitions for a natural voice update."""
+        task_id = str(task.get("task_id") or "").strip()
+        if not task_id:
+            return
+        if task.get("suppress_progress"):
+            self._pending_task_announcements = deque(
+                (
+                    pending
+                    for pending in self._pending_task_announcements
+                    if not (pending[0] == task_id and pending[1] == "running")
+                ),
+                maxlen=20,
+            )
+            return
         status = str(task.get("status") or "").strip().lower()
         progress = str(task.get("progress") or "").strip()
         if status == "running" and not progress:
@@ -330,9 +361,6 @@ class DiscordRealtimeSession:
             "failed",
             "waiting_for_approval",
         }:
-            return
-        task_id = str(task.get("task_id") or "").strip()
-        if not task_id:
             return
         state = (
             f"progress:{task.get('progress_seq')}"

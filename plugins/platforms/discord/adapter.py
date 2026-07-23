@@ -3938,6 +3938,13 @@ class DiscordAdapter(BasePlatformAdapter):
                     logger.exception("Failed to update Discord Realtime task status")
             session = session_ref.get("session")
             if session is not None:
+                if status == "completed":
+                    # A completed task may have updated USER.md, MEMORY.md, or
+                    # SOUL.md. Keep the ongoing Realtime session aligned with
+                    # Hermes' canonical on-disk context without reconnecting.
+                    await session.refresh_identity_context(
+                        load_realtime_identity_context()
+                    )
                 await session.notify_task_status(task)
 
         owner_key = f"discord:{guild_id}:{text_channel_id}:{user_id}"
@@ -3962,6 +3969,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 progress_interval_seconds=float(
                     cfg.get("progress_interval_seconds", 30)
                 ),
+                background_model=cfg.get("background_model"),
                 status_callback=_task_status,
             )
             brokers[guild_id] = broker
