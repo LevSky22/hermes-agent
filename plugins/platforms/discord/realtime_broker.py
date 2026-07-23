@@ -99,6 +99,17 @@ REALTIME_TOOLS: list[dict[str, Any]] = [
             "additionalProperties": False,
         },
     },
+    {
+        "type": "function",
+        "name": "wait_for_user",
+        "description": "End the current turn without speaking when the latest audio is silence, background noise, media playback, side conversation, or speech not addressed to the assistant.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -262,6 +273,8 @@ class HermesRunBroker:
         base_url: str = "http://127.0.0.1:8642",
         max_active: int = 2,
         max_queued: int = 5,
+        progress_after_seconds: float = 12.0,
+        progress_interval_seconds: float = 30.0,
         status_callback: Optional[StatusCallback] = None,
     ):
         self.owner_key = owner_key
@@ -269,6 +282,10 @@ class HermesRunBroker:
         self.base_url = base_url.rstrip("/")
         self.max_active = max(1, int(max_active))
         self.max_queued = max(1, int(max_queued))
+        self.progress_after_seconds = max(5.0, float(progress_after_seconds))
+        self.progress_interval_seconds = max(
+            10.0, float(progress_interval_seconds)
+        )
         self.status_callback = status_callback
         self.store = RealtimeTaskStore(store_path)
         self._http: Optional[aiohttp.ClientSession] = None
@@ -280,6 +297,7 @@ class HermesRunBroker:
         self._workers: dict[str, asyncio.Task] = {}
         self._pump_lock = asyncio.Lock()
         self._always_challenges: dict[tuple[str, str], tuple[float, bool]] = {}
+        self._progress_sequences: dict[str, int] = {}
         self._closed = False
 
     async def start(self) -> None:
@@ -307,6 +325,7 @@ class HermesRunBroker:
             "send_followup_to_hermes": self.followup,
             "cancel_hermes_task": self.cancel,
             "approve_hermes_action": self.approve,
+            "wait_for_user": self.wait,
         }
         handler = handlers.get(name)
         if handler is None:
@@ -315,6 +334,10 @@ class HermesRunBroker:
             result = await handler(**args)
         self.store.cache_call(call_id, self.owner_key, result)
         return result
+
+    async def wait(self) -> dict[str, Any]:
+        """Acknowledge a deliberate no-op turn without starting work."""
+        return {"ok": True, "status": "waiting"}
 
     def record_user_utterance(self, text: str) -> None:
         """Record an exact second-turn permanent-approval confirmation."""
@@ -504,7 +527,39 @@ class HermesRunBroker:
             session_id=started.get("session_id") or payload["session_id"],
         )
         await self._notify(task_id)
-        await self._consume_events(task_id, run_id)
+        progress_task = asyncio.create_task(self._progress_heartbeat(task_id))
+        try:
+            await self._consume_events(task_id, run_id)
+        finally:
+            progress_task.cancel()
+            await asyncio.gather(progress_task, return_exceptions=True)
+
+    async def _progress_heartbeat(self, task_id: str) -> None:
+        """Emit sparse, content-free progress without leaking tools or reasoning."""
+        await asyncio.sleep(self.progress_after_seconds)
+        while not self._closed:
+            task = self._owned(task_id)
+            if task is None or task["status"] in self.TERMINAL:
+                return
+            if task["status"] == "running":
+                await self._notify_progress(task_id)
+            await asyncio.sleep(self.progress_interval_seconds)
+
+    async def _notify_progress(self, task_id: str) -> None:
+        if self.status_callback is None:
+            return
+        task = self._owned(task_id)
+        if task is None or task["status"] != "running":
+            return
+        sequence = self._progress_sequences.get(task_id, 0) + 1
+        self._progress_sequences[task_id] = sequence
+        update = self._public(task)
+        update["progress"] = "Still working on it."
+        update["progress_seq"] = sequence
+        try:
+            await self.status_callback(update)
+        except Exception:
+            logger.exception("Realtime task progress callback failed for %s", task_id)
 
     async def _consume_events(self, task_id: str, run_id: str) -> None:
         http = await self._client()

@@ -3924,6 +3924,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 body += f"\n{str(task['output'])[:1500]}"
             elif task.get("error"):
                 body += f"\n{str(task['error'])[:1500]}"
+            elif task.get("progress"):
+                body += f"\n{str(task['progress'])[:500]}"
             if channel is not None:
                 key = (guild_id, task_id)
                 existing = self._realtime_task_messages.get(key)
@@ -3954,6 +3956,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 base_url=str(cfg.get("api_server_url") or "http://127.0.0.1:8642"),
                 max_active=int(cfg.get("max_active_tasks", 2)),
                 max_queued=int(cfg.get("max_queued_tasks", 5)),
+                progress_after_seconds=float(
+                    cfg.get("progress_after_seconds", 12)
+                ),
+                progress_interval_seconds=float(
+                    cfg.get("progress_interval_seconds", 30)
+                ),
                 status_callback=_task_status,
             )
             brokers[guild_id] = broker

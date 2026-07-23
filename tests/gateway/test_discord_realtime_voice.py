@@ -22,13 +22,14 @@ from plugins.platforms.discord.voice_mixer import (
 )
 
 
-def test_realtime_exposes_exactly_five_narrow_tools():
+def test_realtime_exposes_only_narrow_bridge_tools():
     assert [tool["name"] for tool in REALTIME_TOOLS] == [
         "delegate_to_hermes",
         "get_hermes_task_status",
         "send_followup_to_hermes",
         "cancel_hermes_task",
         "approve_hermes_action",
+        "wait_for_user",
     ]
 
 
@@ -177,10 +178,21 @@ def test_realtime_session_payload_supports_semantic_vad():
 def test_realtime_identity_uses_canonical_soul_and_memory(monkeypatch):
     store = MagicMock()
     store.format_for_system_prompt.side_effect = lambda target: {
-        "memory": "MEMORY (your personal notes)\nUses ClickUp.",
-        "user": "USER PROFILE (who the user is)\nPrefers spoken answers.",
+        "memory": "MEMORY (your personal notes)\nUses a project tracker.",
+        "user": "USER PROFILE (who the user is)\nPrefers audio summaries.",
     }[target]
-    monkeypatch.setattr("agent.prompt_builder.load_soul_md", lambda: "You are Léo.")
+    monkeypatch.setattr(
+        "agent.prompt_builder.load_soul_md",
+        lambda: "Use a calm, professional tone.",
+    )
+    monkeypatch.setattr(
+        "agent.prompt_builder.build_context_files_prompt",
+        lambda **_kwargs: "# Project Context\n\nFollow the workspace contract.",
+    )
+    monkeypatch.setattr(
+        "agent.runtime_cwd.resolve_context_cwd",
+        lambda: "/opt/data",
+    )
     monkeypatch.setattr("tools.memory_tool.load_on_disk_store", lambda: store)
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
@@ -195,10 +207,22 @@ def test_realtime_identity_uses_canonical_soul_and_memory(monkeypatch):
         identity_context=context,
     )
 
-    assert "# Canonical identity (SOUL.md)\n\nYou are Léo." in session.instructions
-    assert "Uses ClickUp." in session.instructions
-    assert "Prefers spoken answers." in session.instructions
-    assert "never mention Hermes" in session.instructions
+    assert "# Canonical identity (SOUL.md)" in session.instructions
+    assert "Use a calm, professional tone." in session.instructions
+    assert "Follow the workspace contract." in session.instructions
+    assert "Uses a project tracker." in session.instructions
+    assert "Prefers audio summaries." in session.instructions
+    assert "Do not mention models, internal agents" in session.instructions
+
+
+def test_realtime_fallback_identity_is_public_and_generic():
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+    )
+
+    assert "neutral, helpful voice assistant" in session.instructions
 
 
 @pytest.mark.asyncio
@@ -225,6 +249,29 @@ async def test_realtime_function_call_uses_broker_and_returns_output():
     sent = [json.loads(call.args[0]) for call in session._ws.send.await_args_list]
     assert sent[0]["item"]["type"] == "function_call_output"
     assert sent[1] == {"type": "response.create"}
+
+
+@pytest.mark.asyncio
+async def test_wait_for_user_ends_turn_without_another_response():
+    broker = MagicMock()
+    broker.handle_tool = AsyncMock(return_value={"ok": True, "status": "waiting"})
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=broker,
+        audio_callback=lambda _pcm: None,
+    )
+    session._ws = AsyncMock()
+
+    await session._handle_event({
+        "type": "response.function_call_arguments.done",
+        "name": "wait_for_user",
+        "call_id": "call_wait",
+        "arguments": "{}",
+    })
+
+    sent = [json.loads(call.args[0]) for call in session._ws.send.await_args_list]
+    assert len(sent) == 1
+    assert sent[0]["item"]["type"] == "function_call_output"
 
 
 @pytest.mark.asyncio
@@ -259,6 +306,60 @@ async def test_running_task_is_not_announced():
     await session.notify_task_status({"task_id": "rtask_1", "status": "running"})
 
     session._ws.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_progress_update_is_announced_without_internal_tool_details():
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+    )
+    session._ws = AsyncMock()
+
+    await session.notify_task_status({
+        "task_id": "rtask_12345678",
+        "status": "running",
+        "progress": "Still working on it.",
+        "progress_seq": 1,
+    })
+
+    sent = [json.loads(call.args[0]) for call in session._ws.send.await_args_list]
+    assert len(sent) == 2
+    update = sent[0]["item"]["content"][0]["text"]
+    assert "still in progress" in update
+    assert "tool" not in update.lower()
+
+
+@pytest.mark.asyncio
+async def test_terminal_update_supersedes_queued_progress():
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+    )
+    session._ws = AsyncMock()
+    session._active_response = True
+
+    await session.notify_task_status({
+        "task_id": "rtask_12345678",
+        "status": "running",
+        "progress": "Still working on it.",
+        "progress_seq": 1,
+    })
+    await session.notify_task_status({
+        "task_id": "rtask_12345678",
+        "status": "completed",
+        "output": "Finished successfully.",
+    })
+    session._active_response = False
+    await session._flush_task_announcements()
+
+    sent = [json.loads(call.args[0]) for call in session._ws.send.await_args_list]
+    assert len(sent) == 2
+    update = sent[0]["item"]["content"][0]["text"]
+    assert "Finished successfully." in update
+    assert "still in progress" not in update
 
 
 @pytest.mark.asyncio
@@ -308,6 +409,42 @@ async def test_broker_call_id_is_idempotent(tmp_path):
         await broker.close()
     assert first == second
     broker.delegate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_broker_emits_sanitized_progress_update(tmp_path):
+    callback = AsyncMock()
+    broker = HermesRunBroker(
+        owner_key="owner",
+        api_key="key",
+        store_path=tmp_path / "progress.sqlite3",
+        status_callback=callback,
+    )
+    now = time.time()
+    broker.store.put_task({
+        "task_id": "rtask_progress",
+        "owner_key": "owner",
+        "prompt": "do work",
+        "status": "running",
+        "run_id": "run_1",
+        "session_id": "session_1",
+        "output": None,
+        "error": None,
+        "approval_id": None,
+        "approval_json": None,
+        "created_at": now,
+        "updated_at": now,
+    })
+    try:
+        await broker._notify_progress("rtask_progress")
+    finally:
+        await broker.close()
+
+    update = callback.await_args.args[0]
+    assert update["status"] == "running"
+    assert update["progress"] == "Still working on it."
+    assert update["progress_seq"] == 1
+    assert "tool" not in update
 
 
 @pytest.mark.asyncio
