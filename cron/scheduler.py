@@ -1492,12 +1492,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
+        if job.get("pause_after_delivery"):
+            management_footer = (
+                "This watcher pauses automatically after this alert. "
+                f"To resume or manage it, send me a new message (job_id: {job_id})."
+            )
+        else:
+            management_footer = (
+                "To stop or manage this job, send me a new message "
+                f"(e.g. \"stop reminder {task_name}\")."
+            )
         delivery_content = (
             f"Cronjob Response: {task_name}\n"
             f"(job_id: {job_id})\n"
             f"-------------\n\n"
             f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+            f"{management_footer}"
         )
     else:
         delivery_content = content
@@ -3825,6 +3835,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # deferred agent is still torn down. Otherwise the outer `except` would
         # swallow the error and leak the agent's subprocesses/clients (#10200).
         delivery_error = None
+        auto_pause_reason = None
         try:
             output_file = save_job_output(job["id"], output)
             if verbose:
@@ -3864,7 +3875,18 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
             if should_deliver:
                 try:
+                    has_external_target = bool(_resolve_delivery_targets(job))
                     delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    if (
+                        success
+                        and delivery_error is None
+                        and has_external_target
+                        and job.get("pause_after_delivery")
+                    ):
+                        auto_pause_reason = (
+                            "Automatically paused after the first successful "
+                            "non-silent delivery."
+                        )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
@@ -3883,7 +3905,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+            mark_kwargs = {"delivery_error": delivery_error}
+            if auto_pause_reason:
+                mark_kwargs["pause_reason"] = auto_pause_reason
+            mark_job_run(job["id"], success, error, **mark_kwargs)
         finish_execution(execution_id, success=success, error=error)
         return True
 

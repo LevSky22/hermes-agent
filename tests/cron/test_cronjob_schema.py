@@ -39,3 +39,11 @@ def test_cronjob_schema_required_array_unchanged():
     from tools.cronjob_tools import CRONJOB_SCHEMA
 
     assert CRONJOB_SCHEMA["parameters"]["required"] == ["action"]
+
+
+def test_cronjob_schema_documents_scheduler_owned_watcher_pause():
+    from tools.cronjob_tools import CRONJOB_SCHEMA
+
+    desc = CRONJOB_SCHEMA["parameters"]["properties"]["pause_after_delivery"]["description"]
+    assert "non-silent external delivery" in desc
+    assert "cronjob(action='pause')" in desc

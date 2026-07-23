@@ -78,6 +78,69 @@ def test_run_one_job_silent_skips_delivery(monkeypatch):
     assert "deliver" not in kinds
 
 
+def test_run_one_job_auto_pauses_after_successful_external_delivery(monkeypatch):
+    """Watcher lifecycle is scheduler-owned, not delegated to the cron agent."""
+    calls = []
+
+    monkeypatch.setattr(
+        s,
+        "run_job",
+        lambda job, defer_agent_teardown=None: (True, "out", "reply found", None),
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: "/tmp/out.txt")
+    monkeypatch.setattr(s, "_resolve_delivery_targets", lambda job: [("discord", "123", None)])
+    monkeypatch.setattr(s, "_deliver_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda jid, ok, err=None, **kwargs: calls.append((jid, ok, kwargs)),
+    )
+
+    ok = s.run_one_job(
+        {"id": "watcher", "name": "watcher", "pause_after_delivery": True}
+    )
+
+    assert ok is True
+    assert calls == [
+        (
+            "watcher",
+            True,
+            {
+                "delivery_error": None,
+                "pause_reason": (
+                    "Automatically paused after the first successful "
+                    "non-silent delivery."
+                ),
+            },
+        )
+    ]
+
+
+def test_run_one_job_does_not_auto_pause_without_external_target(monkeypatch):
+    """A local/no-target result must not consume a one-alert watcher."""
+    calls = []
+
+    monkeypatch.setattr(
+        s,
+        "run_job",
+        lambda job, defer_agent_teardown=None: (True, "out", "reply found", None),
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: "/tmp/out.txt")
+    monkeypatch.setattr(s, "_resolve_delivery_targets", lambda job: [])
+    monkeypatch.setattr(s, "_deliver_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda jid, ok, err=None, **kwargs: calls.append(kwargs),
+    )
+
+    s.run_one_job(
+        {"id": "watcher", "name": "watcher", "pause_after_delivery": True}
+    )
+
+    assert calls == [{"delivery_error": None}]
+
+
 def test_run_one_job_empty_response_is_soft_failure(monkeypatch):
     """An empty final response marks the run as NOT ok (issue #8585)."""
     calls = _patch_pipeline(monkeypatch, final="   ")

@@ -298,6 +298,28 @@ class TestUnifiedCronjobTool:
         assert resumed["success"] is True
         assert resumed["job"]["state"] == "scheduled"
 
+    def test_create_and_update_pause_after_delivery_policy(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Watch for one reply",
+                schedule="every 30m",
+                pause_after_delivery=True,
+            )
+        )
+        assert created["success"] is True
+        assert created["job"]["pause_after_delivery"] is True
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                pause_after_delivery=False,
+            )
+        )
+        assert updated["success"] is True
+        assert updated["job"]["pause_after_delivery"] is False
+
     def test_update_schedule_recomputes_display(self):
         created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
         job_id = created["job_id"]
