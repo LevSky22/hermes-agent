@@ -154,6 +154,25 @@ def test_realtime_session_payload_can_disable_caption_transcription():
     assert payload["tools"] == REALTIME_TOOLS
 
 
+def test_realtime_session_payload_supports_semantic_vad():
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+        vad_type="semantic_vad",
+        vad_eagerness="high",
+    )
+    turn_detection = session._session_update()["session"]["audio"]["input"][
+        "turn_detection"
+    ]
+    assert turn_detection == {
+        "type": "semantic_vad",
+        "eagerness": "high",
+        "create_response": True,
+        "interrupt_response": True,
+    }
+
+
 @pytest.mark.asyncio
 async def test_realtime_function_call_uses_broker_and_returns_output():
     broker = MagicMock()

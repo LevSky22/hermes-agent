@@ -86,6 +86,8 @@ class DiscordRealtimeSession:
         voice: str = "cedar",
         reasoning_effort: str = "low",
         transcription_model: Optional[str] = "gpt-4o-mini-transcribe",
+        vad_type: str = "server_vad",
+        vad_eagerness: str = "auto",
         vad_threshold: float = 0.7,
         vad_prefix_ms: int = 300,
         vad_silence_ms: int = 700,
@@ -103,6 +105,16 @@ class DiscordRealtimeSession:
         self.reasoning_effort = reasoning_effort
         self.transcription_model = (
             str(transcription_model).strip() if transcription_model else None
+        )
+        self.vad_type = (
+            str(vad_type).strip().lower()
+            if str(vad_type).strip().lower() in {"server_vad", "semantic_vad"}
+            else "server_vad"
+        )
+        self.vad_eagerness = (
+            str(vad_eagerness).strip().lower()
+            if str(vad_eagerness).strip().lower() in {"low", "medium", "high", "auto"}
+            else "auto"
         )
         self.vad_threshold = max(0.0, min(1.0, float(vad_threshold)))
         self.vad_prefix_ms = max(0, int(vad_prefix_ms))
@@ -333,16 +345,25 @@ class DiscordRealtimeSession:
                 self._ws = None
 
     def _session_update(self) -> dict[str, Any]:
-        audio_input: dict[str, Any] = {
-            "format": {"type": "audio/pcm", "rate": 24000},
-            "turn_detection": {
+        if self.vad_type == "semantic_vad":
+            turn_detection: dict[str, Any] = {
+                "type": "semantic_vad",
+                "eagerness": self.vad_eagerness,
+                "create_response": True,
+                "interrupt_response": True,
+            }
+        else:
+            turn_detection = {
                 "type": "server_vad",
                 "threshold": self.vad_threshold,
                 "prefix_padding_ms": self.vad_prefix_ms,
                 "silence_duration_ms": self.vad_silence_ms,
                 "create_response": True,
                 "interrupt_response": True,
-            },
+            }
+        audio_input: dict[str, Any] = {
+            "format": {"type": "audio/pcm", "rate": 24000},
+            "turn_detection": turn_detection,
         }
         if self.transcription_model:
             audio_input["transcription"] = {"model": self.transcription_model}

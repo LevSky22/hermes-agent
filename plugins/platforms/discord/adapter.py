@@ -3986,6 +3986,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 if cfg.get("transcription_enabled", True)
                 else None
             ),
+            vad_type=str(cfg.get("vad_type") or "server_vad"),
+            vad_eagerness=str(cfg.get("vad_eagerness") or "auto"),
             vad_threshold=float(cfg.get("vad_threshold", 0.7)),
             vad_prefix_ms=int(cfg.get("vad_prefix_ms", 300)),
             vad_silence_ms=int(cfg.get("vad_silence_ms", 700)),
