@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import time
 from array import array
@@ -10,6 +11,7 @@ from plugins.platforms.discord.adapter import DiscordAdapter
 from plugins.platforms.discord.realtime_broker import HermesRunBroker, REALTIME_TOOLS
 from plugins.platforms.discord.realtime_voice import (
     DiscordRealtimeSession,
+    REALTIME_INPUT_FRAME_BYTES,
     load_realtime_identity_context,
     pcm_24k_mono_to_48k_stereo,
     pcm_48k_stereo_to_24k_mono,
@@ -76,6 +78,55 @@ async def test_realtime_gates_idle_silence_but_forwards_vad_tail():
     assert not session._input_gate_open
     # Server VAD owns commit and response creation; the client only appends.
     assert session._ws.send.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_realtime_synthesizes_silence_when_discord_packets_stop():
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+        vad_silence_ms=2000,
+    )
+    session._ws = AsyncMock()
+    session._input_gate_open = True
+    session._user_speaking = True
+    session._last_loud_input_at = time.monotonic()
+
+    sender = asyncio.create_task(session._send_audio())
+    await asyncio.sleep(0.07)
+    sender.cancel()
+    await asyncio.gather(sender, return_exceptions=True)
+
+    payloads = [json.loads(call.args[0]) for call in session._ws.send.await_args_list]
+    appended = [
+        payload
+        for payload in payloads
+        if payload["type"] == "input_audio_buffer.append"
+    ]
+    assert len(appended) >= 2
+    assert all(
+        len(base64.b64decode(payload["audio"])) == REALTIME_INPUT_FRAME_BYTES
+        for payload in appended
+    )
+
+
+@pytest.mark.asyncio
+async def test_realtime_speech_stopped_closes_synthetic_silence_gate():
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+    )
+    session._input_gate_open = True
+    session._user_speaking = True
+    session._last_loud_input_at = time.monotonic()
+
+    await session._handle_event({"type": "input_audio_buffer.speech_stopped"})
+
+    assert not session._user_speaking
+    assert not session._input_gate_open
+    assert session._last_loud_input_at == 0.0
 
 
 def test_realtime_audio_source_ends_after_idle_grace():

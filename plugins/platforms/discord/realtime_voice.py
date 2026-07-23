@@ -21,6 +21,9 @@ AudioCallback = Callable[[bytes], None]
 TextCallback = Callable[[str, str], Awaitable[None]]
 
 REALTIME_URL = "wss://api.openai.com/v1/realtime"
+REALTIME_INPUT_RATE = 24000
+REALTIME_INPUT_FRAME_MS = 20
+REALTIME_INPUT_FRAME_BYTES = REALTIME_INPUT_RATE * 2 * REALTIME_INPUT_FRAME_MS // 1000
 
 DEFAULT_INSTRUCTIONS = """# Role and objective
 Follow the canonical identity and user context above when present. If none is
@@ -633,17 +636,47 @@ class DiscordRealtimeSession:
             })
 
     async def _send_audio(self) -> None:
+        """Stream Discord PCM and bridge packet gaps with paced silence.
+
+        Discord voice receive callbacks are packet-driven and may stop as soon
+        as a member stops transmitting. Realtime VAD still needs subsequent
+        PCM silence to emit ``speech_stopped``. While an input turn is open,
+        synthesize 20 ms zero-PCM frames when no Discord packet arrives.
+        """
         while True:
-            pcm = await self._input.get()
+            if self._paused:
+                await asyncio.sleep(REALTIME_INPUT_FRAME_MS / 1000)
+                continue
+            queued = False
             try:
-                if self._paused or not pcm:
+                pcm = await asyncio.wait_for(
+                    self._input.get(),
+                    timeout=REALTIME_INPUT_FRAME_MS / 1000,
+                )
+                queued = True
+            except TimeoutError:
+                if not self._input_gate_open:
+                    continue
+                # A noise spike that never becomes server-recognized speech
+                # must not keep an idle Realtime stream open forever.
+                if (
+                    not self._user_speaking
+                    and (time.monotonic() - self._last_loud_input_at) * 1000
+                    >= self.vad_silence_ms
+                ):
+                    self._reset_input_gate()
+                    continue
+                pcm = b"\x00" * REALTIME_INPUT_FRAME_BYTES
+            try:
+                if not pcm:
                     continue
                 await self._send({
                     "type": "input_audio_buffer.append",
                     "audio": base64.b64encode(pcm).decode("ascii"),
                 })
             finally:
-                self._input.task_done()
+                if queued:
+                    self._input.task_done()
 
     async def _handle_event(self, event: dict[str, Any]) -> None:
         kind = str(event.get("type") or "")
@@ -656,6 +689,7 @@ class DiscordRealtimeSession:
             return
         if kind == "input_audio_buffer.speech_stopped":
             self._user_speaking = False
+            self._reset_input_gate()
             logger.info("Discord Realtime VAD event: %s", kind)
             return
         if kind == "session.updated":
