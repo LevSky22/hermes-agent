@@ -94,6 +94,7 @@ class RealtimePCMQueueAudioSource(discord.AudioSource):
         self._frames: "queue.Queue[bytes]" = queue.Queue(maxsize=self.MAX_FRAMES)
         self._pending = bytearray()
         self._closed = False
+        self._played_frames = 0
         self._last_feed_at = time.monotonic()
         if pcm:
             self.feed(pcm)
@@ -101,6 +102,11 @@ class RealtimePCMQueueAudioSource(discord.AudioSource):
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def played_ms(self) -> int:
+        """Return model-audio playback consumed by Discord, in milliseconds."""
+        return self._played_frames * FRAME_LENGTH_MS
 
     def feed(self, pcm: bytes) -> bool:
         """Append Discord-native PCM, returning false on bounded overrun."""
@@ -134,7 +140,9 @@ class RealtimePCMQueueAudioSource(discord.AudioSource):
         if self._closed:
             return b""
         try:
-            return self._frames.get_nowait()
+            frame = self._frames.get_nowait()
+            self._played_frames += 1
+            return frame
         except queue.Empty:
             pass
 
@@ -143,6 +151,7 @@ class RealtimePCMQueueAudioSource(discord.AudioSource):
             chunk = bytes(self._pending)
             self._pending.clear()
             self._closed = True
+            self._played_frames += 1
             return chunk + (b"\x00" * (FRAME_SIZE - len(chunk)))
         if idle_for < self.IDLE_TIMEOUT_SECONDS:
             return SILENCE_FRAME
