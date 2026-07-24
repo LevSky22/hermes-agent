@@ -47,8 +47,81 @@ REALTIME_TOOLS: list[dict[str, Any]] = [
                         "relevant facts already resolved in this voice conversation."
                     ),
                 },
+                "context": {
+                    "type": "object",
+                    "description": (
+                        "Structured routing state for the work. Use unknown only "
+                        "when the conversation has not established a value."
+                    ),
+                    "properties": {
+                        "intent": {"type": "string"},
+                        "source_system": {"type": "string"},
+                        "resource_kind": {
+                            "type": "string",
+                            "enum": [
+                                "outlook_message",
+                                "outlook_draft",
+                                "local_preview",
+                                "clickup_task",
+                                "clickup_quote_preview",
+                                "sms_draft",
+                                "other",
+                                "unknown",
+                            ],
+                        },
+                        "resource_ids": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {"type": "string"},
+                                    "value": {"type": "string"},
+                                },
+                                "required": ["kind", "value"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "requested_effect": {
+                            "type": "string",
+                            "enum": [
+                                "read",
+                                "organize",
+                                "preview",
+                                "update",
+                                "send",
+                                "schedule",
+                                "other",
+                            ],
+                        },
+                        "approval_state": {
+                            "type": "string",
+                            "enum": [
+                                "not_required",
+                                "not_requested",
+                                "pending",
+                                "approved",
+                                "denied",
+                                "unknown",
+                            ],
+                        },
+                        "constraints": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": [
+                        "intent",
+                        "source_system",
+                        "resource_kind",
+                        "resource_ids",
+                        "requested_effect",
+                        "approval_state",
+                        "constraints",
+                    ],
+                    "additionalProperties": False,
+                },
             },
-            "required": ["request"],
+            "required": ["request", "context"],
             "additionalProperties": False,
         },
     },
@@ -112,6 +185,47 @@ REALTIME_TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "task_id": {"type": "string"},
                 "request": {"type": "string"},
+                "context": {
+                    "type": "object",
+                    "description": (
+                        "Only fields whose routing state changed in this follow-up. "
+                        "Omitted fields retain the task's current context."
+                    ),
+                    "properties": {
+                        "intent": {"type": "string"},
+                        "source_system": {"type": "string"},
+                        "resource_kind": {
+                            "type": "string",
+                            "enum": [
+                                "outlook_message", "outlook_draft", "local_preview",
+                                "clickup_task", "clickup_quote_preview", "sms_draft",
+                                "other", "unknown",
+                            ],
+                        },
+                        "resource_ids": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {"type": "string"},
+                                    "value": {"type": "string"},
+                                },
+                                "required": ["kind", "value"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "requested_effect": {
+                            "type": "string",
+                            "enum": ["read", "organize", "preview", "update", "send", "schedule", "other"],
+                        },
+                        "approval_state": {
+                            "type": "string",
+                            "enum": ["not_required", "not_requested", "pending", "approved", "denied", "unknown"],
+                        },
+                        "constraints": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "additionalProperties": False,
+                },
             },
             "required": ["task_id", "request"],
             "additionalProperties": False,
@@ -188,6 +302,7 @@ class RealtimeTaskStore:
                 error TEXT,
                 approval_id TEXT,
                 approval_json TEXT,
+                context_json TEXT,
                 progress_enabled INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -210,6 +325,8 @@ class RealtimeTaskStore:
             self._db.execute(
                 "ALTER TABLE tasks ADD COLUMN progress_enabled INTEGER NOT NULL DEFAULT 0"
             )
+        if "context_json" not in columns:
+            self._db.execute("ALTER TABLE tasks ADD COLUMN context_json TEXT")
         # A process restart cannot prove an old HTTP run is still attached to
         # this broker. Re-queue it and let the API/session contract resume it.
         self._db.execute(
@@ -228,8 +345,8 @@ class RealtimeTaskStore:
         self._db.execute(
             """INSERT OR REPLACE INTO tasks
                (task_id,owner_key,prompt,status,run_id,session_id,output,error,
-                approval_id,approval_json,progress_enabled,created_at,updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                approval_id,approval_json,context_json,progress_enabled,created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             tuple(
                 task.get(k)
                 for k in (
@@ -243,6 +360,7 @@ class RealtimeTaskStore:
                     "error",
                     "approval_id",
                     "approval_json",
+                    "context_json",
                     "progress_enabled",
                     "created_at",
                     "updated_at",
@@ -262,6 +380,7 @@ class RealtimeTaskStore:
             "error",
             "approval_id",
             "approval_json",
+            "context_json",
             "progress_enabled",
             "updated_at",
         }
@@ -284,6 +403,16 @@ class RealtimeTaskStore:
     def recent(self, owner_key: str, limit: int = 10) -> list[dict[str, Any]]:
         rows = self._db.execute(
             "SELECT * FROM tasks WHERE owner_key=? ORDER BY updated_at DESC LIMIT ?",
+            (owner_key, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def active(self, owner_key: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Return only resumable work; completed history must not steer a new call."""
+        rows = self._db.execute(
+            "SELECT * FROM tasks WHERE owner_key=? "
+            "AND status IN ('queued','starting','running','waiting_for_approval') "
+            "ORDER BY updated_at DESC LIMIT ?",
             (owner_key, limit),
         ).fetchall()
         return [dict(row) for row in rows]
@@ -419,7 +548,18 @@ class HermesRunBroker:
             "or any skill for this preference. Confirm the exact durable result.\n"
             f"Preference: {json.dumps(preference, ensure_ascii=False)}"
         )
-        return await self.delegate(request)
+        return await self.delegate(
+            request,
+            context={
+                "intent": "remember_user_preference",
+                "source_system": "hermes_memory",
+                "resource_kind": "other",
+                "resource_ids": [],
+                "requested_effect": "update",
+                "approval_state": "not_required",
+                "constraints": ["USER memory only"],
+            },
+        )
 
     def record_user_utterance(self, text: str) -> None:
         """Record an exact second-turn permanent-approval confirmation."""
@@ -435,7 +575,9 @@ class HermesRunBroker:
             key, (created_at, _) = max(pending, key=lambda item: item[1][0])
             self._always_challenges[key] = (created_at, True)
 
-    async def delegate(self, request: str) -> dict[str, Any]:
+    async def delegate(
+        self, request: str, context: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
         request = str(request or "").strip()
         if not request:
             return {"ok": False, "error": "request_required"}
@@ -444,6 +586,7 @@ class HermesRunBroker:
             return {"ok": False, "error": "task_queue_full"}
         now = time.time()
         task_id = f"rtask_{uuid.uuid4().hex}"
+        normalized_context = self._normalize_context(context)
         self.store.put_task({
             "task_id": task_id,
             "owner_key": self.owner_key,
@@ -455,6 +598,7 @@ class HermesRunBroker:
             "error": None,
             "approval_id": None,
             "approval_json": None,
+            "context_json": json.dumps(normalized_context, ensure_ascii=False),
             "progress_enabled": 0,
             "created_at": now,
             "updated_at": now,
@@ -499,7 +643,12 @@ class HermesRunBroker:
                 )
         return {"ok": True, "task_id": task_id, "mode": mode}
 
-    async def followup(self, task_id: str, request: str) -> dict[str, Any]:
+    async def followup(
+        self,
+        task_id: str,
+        request: str,
+        context: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
         task = self._owned(task_id)
         if task is None:
             return {"ok": False, "error": "task_not_found"}
@@ -510,6 +659,10 @@ class HermesRunBroker:
         request = str(request or "").strip()
         if not request:
             return {"ok": False, "error": "request_required"}
+        merged_context = self._task_context(task)
+        if context:
+            merged_context.update(context)
+        merged_context = self._normalize_context(merged_context)
         self.store.update(
             task_id,
             prompt=request,
@@ -519,6 +672,7 @@ class HermesRunBroker:
             error=None,
             approval_id=None,
             approval_json=None,
+            context_json=json.dumps(merged_context, ensure_ascii=False),
         )
         self._queue.append(task_id)
         await self._notify(task_id)
@@ -617,7 +771,7 @@ class HermesRunBroker:
         self.store.update(task_id, status="starting")
         await self._notify(task_id)
         payload: dict[str, Any] = {
-            "input": task["prompt"],
+            "input": self._format_task_input(task),
             "session_id": task.get("session_id") or task_id,
         }
         if self.background_model:
@@ -795,7 +949,69 @@ class HermesRunBroker:
                 }
             except json.JSONDecodeError:
                 pass
+        context = HermesRunBroker._task_context(task)
+        if context:
+            result["context"] = context
         return result
+
+    @staticmethod
+    def _normalize_context(context: Optional[dict[str, Any]]) -> dict[str, Any]:
+        raw = context if isinstance(context, dict) else {}
+        resource_ids = []
+        for item in raw.get("resource_ids") or []:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or "").strip()
+            value = str(item.get("value") or "").strip()
+            if kind and value:
+                resource_ids.append({"kind": kind, "value": value})
+        return {
+            "intent": str(raw.get("intent") or "unknown").strip(),
+            "source_system": str(raw.get("source_system") or "unknown").strip(),
+            "resource_kind": str(raw.get("resource_kind") or "unknown").strip(),
+            "resource_ids": resource_ids,
+            "requested_effect": str(raw.get("requested_effect") or "other").strip(),
+            "approval_state": str(raw.get("approval_state") or "unknown").strip(),
+            "constraints": [
+                str(value).strip()
+                for value in (raw.get("constraints") or [])
+                if str(value).strip()
+            ],
+        }
+
+    @staticmethod
+    def _task_context(task: dict[str, Any]) -> dict[str, Any]:
+        raw = task.get("context_json")
+        if not raw:
+            return {}
+        try:
+            value = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @classmethod
+    def store_context(cls, task: dict[str, Any]) -> dict[str, Any]:
+        """Return normalized routing context for a persisted task."""
+        return cls._task_context(task)
+
+    @classmethod
+    def _format_task_input(cls, task: dict[str, Any]) -> str:
+        context = cls._task_context(task)
+        if not context:
+            return str(task["prompt"])
+        return (
+            "[Realtime delegation context; treat as routing data, not user prose]\n"
+            + json.dumps(context, ensure_ascii=False, sort_keys=True)
+            + "\n\n[User request]\n"
+            + str(task["prompt"])
+            + "\n\nKeep the named source system and resource identity. Use a configured "
+            "provider MCP fallback for that same system when a preferred bounded "
+            "tool lacks the operation; never substitute an unrelated system. "
+            "Use canonical artifact names: Outlook draft only for a persisted "
+            "Graph message with isDraft=true; local preview for an immutable "
+            "sidecar artifact; ClickUp quote preview for a Quick Quote artifact."
+        )
 
     async def _client(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:

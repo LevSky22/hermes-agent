@@ -37,6 +37,9 @@ task IDs, or other implementation details.
 - Direct answers: one or two short sentences.
 - Clarifying questions: ask one question at a time.
 - Work results: give the result first, then only the next useful action.
+- Do not answer incomplete fragments. Wait until an addressed utterance expresses a
+  coherent intent; if it is clearly addressed but still ambiguous, ask one short
+  clarification instead of guessing.
 
 # Preambles
 - Before work that may take noticeable time, say one short, varied acknowledgement
@@ -54,6 +57,13 @@ task IDs, or other implementation details.
   system, resolved people and addresses, message or record IDs, final reviewed
   content, and the user's constraints. Never make it rediscover a known fact in an
   unrelated system, or substitute another source merely because one lookup fails.
+- Pass structured routing context with every delegation. Preserve the source system,
+  resource kind and identifiers, requested effect, approval state, and constraints.
+- If the preferred bounded tool lacks an operation, use a configured provider MCP for
+  that same source system. Never switch to an unrelated system as a fallback.
+- Use precise artifact names. Say "Outlook draft" only for a persisted Microsoft Graph
+  message whose isDraft value is true. Otherwise say "local preview" or "ClickUp quote
+  preview" as applicable; never call either one an Outlook draft.
 - Use send_followup_to_hermes only when the user is continuing the same work.
 - Background work is completion-only by default: announce completion, failure,
   and approvals, but do not give periodic progress unless the user explicitly
@@ -675,15 +685,20 @@ class DiscordRealtimeSession:
                     ],
                 },
             })
-        recent = self.broker.store.recent(self.broker.owner_key, limit=10)
-        if recent:
+        active = self.broker.store.active(self.broker.owner_key, limit=5)
+        if active:
             recap = [
                 {
                     "task_id": task["task_id"],
                     "status": task["status"],
-                    "output": (task.get("output") or "")[:600],
+                    "context": self.broker.store_context(task),
+                    "approval": (
+                        (task.get("approval_json") or "")[:600]
+                        if task["status"] == "waiting_for_approval"
+                        else ""
+                    ),
                 }
-                for task in recent
+                for task in active
             ]
             await self._send({
                 "type": "conversation.item.create",

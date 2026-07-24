@@ -50,6 +50,11 @@ def test_delegate_contract_requires_resolved_context_and_source_fidelity():
     assert "source system" in description
     assert "message or record IDs" in description
     assert "facts already resolved" in request_description
+    assert delegate["parameters"]["required"] == ["request", "context"]
+    context = delegate["parameters"]["properties"]["context"]
+    assert context["additionalProperties"] is False
+    assert "source_system" in context["required"]
+    assert "resource_kind" in context["required"]
 
 
 @pytest.mark.asyncio
@@ -757,6 +762,79 @@ async def test_broker_routes_background_runs_through_configured_model(tmp_path):
         await broker.close()
     payload = broker._request.await_args.args[2]
     assert payload["model"] == "realtime-background"
+
+
+@pytest.mark.asyncio
+async def test_broker_passes_structured_context_and_same_system_fallback(tmp_path):
+    broker = HermesRunBroker(
+        owner_key="owner",
+        api_key="key",
+        store_path=tmp_path / "routing-context.sqlite3",
+    )
+    now = time.time()
+    context = {
+        "intent": "reply_to_existing_customer_email",
+        "source_system": "microsoft_graph",
+        "resource_kind": "outlook_message",
+        "resource_ids": [{"kind": "message_id", "value": "msg_1"}],
+        "requested_effect": "preview",
+        "approval_state": "not_requested",
+        "constraints": ["reply in the existing thread"],
+    }
+    broker.store.put_task({
+        "task_id": "rtask_context",
+        "owner_key": "owner",
+        "prompt": "Prepare the revised reply.",
+        "status": "queued",
+        "run_id": None,
+        "session_id": None,
+        "output": None,
+        "error": None,
+        "approval_id": None,
+        "approval_json": None,
+        "context_json": json.dumps(context),
+        "created_at": now,
+        "updated_at": now,
+    })
+    broker._request = AsyncMock(return_value={"error": "stop after capture"})
+    try:
+        await broker._run_task("rtask_context")
+    finally:
+        await broker.close()
+
+    payload = broker._request.await_args.args[2]
+    assert '"source_system": "microsoft_graph"' in payload["input"]
+    assert "same system" in payload["input"]
+    assert "Outlook draft only" in payload["input"]
+
+
+def test_task_store_active_excludes_completed_history(tmp_path):
+    broker = HermesRunBroker(
+        owner_key="owner",
+        api_key="key",
+        store_path=tmp_path / "active-only.sqlite3",
+    )
+    now = time.time()
+    for task_id, status in (("active", "running"), ("old", "completed")):
+        broker.store.put_task({
+            "task_id": task_id,
+            "owner_key": "owner",
+            "prompt": "work",
+            "status": status,
+            "run_id": None,
+            "session_id": None,
+            "output": "stale result" if status == "completed" else None,
+            "error": None,
+            "approval_id": None,
+            "approval_json": None,
+            "created_at": now,
+            "updated_at": now,
+        })
+    try:
+        active = broker.store.active("owner")
+    finally:
+        broker.store.close()
+    assert [task["task_id"] for task in active] == ["active"]
 
 
 @pytest.mark.asyncio

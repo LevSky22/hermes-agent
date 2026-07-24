@@ -3939,7 +3939,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 body += f"\n{str(task['error'])[:1500]}"
             elif task.get("progress"):
                 body += f"\n{str(task['progress'])[:500]}"
-            if channel is not None:
+            # Voice announces opt-in progress and terminal transitions. Keep the
+            # text channel to one lifecycle card created at the first actionable
+            # or terminal state; queued/starting/running edits otherwise leave a
+            # misleading old timestamp above the later "queued" acknowledgement.
+            present_in_text = status in {
+                "waiting_for_approval",
+                "completed",
+                "failed",
+                "cancelled",
+            }
+            if channel is not None and present_in_text:
                 key = (guild_id, task_id)
                 existing = self._realtime_task_messages.get(key)
                 try:
