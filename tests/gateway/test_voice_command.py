@@ -2683,6 +2683,29 @@ class TestVoiceReception:
         assert 100 in receiver._buffers
         assert len(receiver._buffers[100]) > 0
 
+    def test_on_packet_realtime_automaps_first_packet(self):
+        """Realtime receives the first utterance even before SPEAKING maps SSRC."""
+        dave = MagicMock()
+        dave.decrypt.return_value = b"\xf8\xff\xfe"
+        receiver = self._make_receiver_with_nacl(dave_session=dave)
+        receiver._allowed_user_ids = {"42"}
+        receiver._vc.channel.members = [
+            SimpleNamespace(id=9999, name="Bot"),
+            SimpleNamespace(id=42, name="Alice"),
+        ]
+        callback = MagicMock(return_value=True)
+        receiver.set_pcm_callback(callback)
+        decoder = self._inject_mock_decoder(receiver, 100)
+
+        with patch("nacl.secret.Aead") as mock_aead:
+            mock_aead.return_value.decrypt.return_value = b"\xf8\xff\xfe"
+            receiver._on_packet(self._build_rtp_packet(ssrc=100))
+
+        callback.assert_called_once_with(42, decoder.decode.return_value)
+        dave.decrypt.assert_called_once()
+        assert receiver._ssrc_to_user[100] == 42
+        assert len(receiver._buffers.get(100, b"")) == 0
+
     def test_on_packet_bot_own_ssrc_ignored(self):
         """Bot's own SSRC → dropped (echo prevention)."""
         receiver = self._make_receiver_with_nacl()

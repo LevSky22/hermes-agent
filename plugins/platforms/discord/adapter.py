@@ -614,6 +614,12 @@ class VoiceReceiver:
         if self._dave_session:
             with self._lock:
                 user_id = self._ssrc_to_user.get(ssrc, 0)
+            if not user_id and self._pcm_callback is not None:
+                # Discord does not always send SPEAKING before the first RTP
+                # packet after a bot joins. Realtime cannot wait for the
+                # classic silence poll to infer the user or the entire first
+                # utterance is routed away from its low-latency callback.
+                user_id = self._infer_user_for_ssrc(ssrc)
             if user_id:
                 try:
                     import davey
@@ -637,6 +643,8 @@ class VoiceReceiver:
             pcm = self._decoders[ssrc].decode(decrypted)
             with self._lock:
                 user_id = self._ssrc_to_user.get(ssrc, 0)
+            if not user_id and self._pcm_callback is not None:
+                user_id = self._infer_user_for_ssrc(ssrc)
             consumed = False
             if user_id and self._pcm_callback is not None:
                 try:
