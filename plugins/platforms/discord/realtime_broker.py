@@ -325,8 +325,8 @@ class HermesRunBroker:
         base_url: str = "http://127.0.0.1:8642",
         max_active: int = 2,
         max_queued: int = 5,
-        progress_after_seconds: float = 12.0,
-        progress_interval_seconds: float = 30.0,
+        progress_after_seconds: float = 25.0,
+        progress_interval_seconds: float = 60.0,
         background_model: Optional[str] = None,
         status_callback: Optional[StatusCallback] = None,
     ):

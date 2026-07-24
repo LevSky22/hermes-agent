@@ -56,6 +56,32 @@ async def test_realtime_becomes_ready_only_after_session_updated():
     assert ws.recv.await_count == 2
 
 
+@pytest.mark.asyncio
+async def test_realtime_records_first_turn_latency_milestones():
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+    )
+    session._startup_started_at = time.monotonic()
+    session._connection_started_at = session._startup_started_at
+
+    await session._handle_event({"type": "session.updated", "session": {}})
+    session._process_input_chunk(array("h", [1000] * 240).tobytes(), 1000)
+    await session._handle_event({"type": "input_audio_buffer.speech_started"})
+    await session._handle_event({"type": "input_audio_buffer.speech_stopped"})
+    await session._handle_event({
+        "type": "response.output_audio.delta",
+        "delta": base64.b64encode(b"\x00\x00" * 240).decode("ascii"),
+    })
+
+    assert session._session_ready_at is not None
+    assert session._first_input_at is not None
+    assert session._first_speech_started_at is not None
+    assert session._last_speech_stopped_at is not None
+    assert session._first_output_at is not None
+
+
 def test_pcm_conversion_preserves_duration_and_channels():
     discord_pcm = array("h", range(480 * 2)).tobytes()
     realtime_pcm = pcm_48k_stereo_to_24k_mono(discord_pcm)

@@ -3965,10 +3965,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 max_active=int(cfg.get("max_active_tasks", 2)),
                 max_queued=int(cfg.get("max_queued_tasks", 5)),
                 progress_after_seconds=float(
-                    cfg.get("progress_after_seconds", 12)
+                    cfg.get("progress_after_seconds", 25)
                 ),
                 progress_interval_seconds=float(
-                    cfg.get("progress_interval_seconds", 30)
+                    cfg.get("progress_interval_seconds", 60)
                 ),
                 background_model=cfg.get("background_model"),
                 status_callback=_task_status,

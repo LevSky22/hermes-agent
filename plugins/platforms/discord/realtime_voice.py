@@ -253,6 +253,13 @@ class DiscordRealtimeSession:
         self._sent_audio_chunks = 0
         self._received_audio_chunks = 0
         self._session_updated_logged = False
+        self._startup_started_at: Optional[float] = None
+        self._connection_started_at: Optional[float] = None
+        self._session_ready_at: Optional[float] = None
+        self._first_input_at: Optional[float] = None
+        self._first_speech_started_at: Optional[float] = None
+        self._last_speech_stopped_at: Optional[float] = None
+        self._first_output_at: Optional[float] = None
         self.last_error: Optional[str] = None
 
     @property
@@ -285,6 +292,7 @@ class DiscordRealtimeSession:
             return
         self._loop = asyncio.get_running_loop()
         self._stopping = False
+        self._startup_started_at = time.monotonic()
         await self.broker.start()
         self._runner = asyncio.create_task(self._run())
         try:
@@ -467,6 +475,14 @@ class DiscordRealtimeSession:
         prefix while idle, then forward all frames through the VAD window.
         """
         now = time.monotonic()
+        if self._first_input_at is None:
+            self._first_input_at = now
+            logger.info(
+                "Discord Realtime first input: startup_ms=%s ready_ms=%s rms=%.1f",
+                self._elapsed_ms(self._startup_started_at, now),
+                self._elapsed_ms(self._session_ready_at, now),
+                rms,
+            )
         loud = rms >= self.input_silence_threshold
         if not self._input_gate_open:
             if not loud:
@@ -556,6 +572,12 @@ class DiscordRealtimeSession:
                 "websockets is required for Discord Realtime voice"
             ) from exc
 
+        self._connection_started_at = time.monotonic()
+        self._session_ready_at = None
+        self._first_input_at = None
+        self._first_speech_started_at = None
+        self._last_speech_stopped_at = None
+        self._first_output_at = None
         url = f"{REALTIME_URL}?model={self.model}"
         headers = {"Authorization": f"Bearer {self.api_key}"}
         async with connect(
@@ -740,6 +762,15 @@ class DiscordRealtimeSession:
     async def _handle_event(self, event: dict[str, Any]) -> None:
         kind = str(event.get("type") or "")
         if kind == "input_audio_buffer.speech_started":
+            now = time.monotonic()
+            if self._first_speech_started_at is None:
+                self._first_speech_started_at = now
+                logger.info(
+                    "Discord Realtime first VAD speech: startup_ms=%s ready_ms=%s input_ms=%s",
+                    self._elapsed_ms(self._startup_started_at, now),
+                    self._elapsed_ms(self._session_ready_at, now),
+                    self._elapsed_ms(self._first_input_at, now),
+                )
             interrupted_response = self._active_response or self._barge_in_notified
             self._user_speaking = True
             logger.info("Discord Realtime VAD event: %s", kind)
@@ -753,6 +784,7 @@ class DiscordRealtimeSession:
                 await self.text_callback("barge_in_confirmed", "")
             return
         if kind == "input_audio_buffer.speech_stopped":
+            self._last_speech_stopped_at = time.monotonic()
             self._user_speaking = False
             self._reset_input_gate()
             # Turn detection has create_response=true. Reserve the response
@@ -761,13 +793,17 @@ class DiscordRealtimeSession:
             logger.info("Discord Realtime VAD event: %s", kind)
             return
         if kind == "session.updated":
+            now = time.monotonic()
+            self._session_ready_at = now
             self._connected.set()
             if not self._session_updated_logged:
                 self._session_updated_logged = True
                 logger.info(
-                    "Discord Realtime session updated: model=%s voice=%s",
+                    "Discord Realtime session updated: model=%s voice=%s connect_ms=%s startup_ms=%s",
                     self.model,
                     self.voice,
+                    self._elapsed_ms(self._connection_started_at, now),
+                    self._elapsed_ms(self._startup_started_at, now),
                 )
             return
         if kind == "response.created":
@@ -806,6 +842,15 @@ class DiscordRealtimeSession:
                     pcm = b""
                 if pcm:
                     self._received_audio_chunks += 1
+                    if self._first_output_at is None:
+                        now = time.monotonic()
+                        self._first_output_at = now
+                        logger.info(
+                            "Discord Realtime first output: startup_ms=%s ready_ms=%s speech_stop_ms=%s",
+                            self._elapsed_ms(self._startup_started_at, now),
+                            self._elapsed_ms(self._session_ready_at, now),
+                            self._elapsed_ms(self._last_speech_stopped_at, now),
+                        )
                     if self._received_audio_chunks <= 3 or self._received_audio_chunks in {10, 25, 50, 100}:
                         logger.info(
                             "Discord Realtime output chunk #%d: bytes=%d",
@@ -895,6 +940,12 @@ class DiscordRealtimeSession:
             ),
             maxlen=20,
         )
+
+    @staticmethod
+    def _elapsed_ms(start: Optional[float], end: float) -> Optional[int]:
+        if start is None:
+            return None
+        return max(0, round((end - start) * 1000))
 
     async def _send(self, payload: dict[str, Any]) -> None:
         if self._ws is None:
