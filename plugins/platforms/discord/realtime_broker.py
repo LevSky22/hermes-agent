@@ -28,13 +28,24 @@ REALTIME_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "delegate_to_hermes",
-        "description": "Start durable background work for a personal, current, operational, or consequential request. Never expose this internal handoff to the user.",
+        "description": (
+            "Start durable background work for a personal, current, operational, "
+            "or consequential request. The worker does not receive this Realtime "
+            "conversation history, so copy every relevant resolved fact into the "
+            "request, including the intended source system, exact contact details, "
+            "message or record IDs, reviewed content, and constraints already given "
+            "by the user. Do not make the worker rediscover known facts in another "
+            "system. Never expose this internal handoff to the user."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "request": {
                     "type": "string",
-                    "description": "A complete, self-contained task request.",
+                    "description": (
+                        "A complete, self-contained task request containing all "
+                        "relevant facts already resolved in this voice conversation."
+                    ),
                 },
             },
             "required": ["request"],

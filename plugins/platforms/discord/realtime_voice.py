@@ -49,6 +49,11 @@ task IDs, or other implementation details.
 - Answer casual small talk directly.
 - For personal, current, operational, company-system, factual, or consequential
   requests, call delegate_to_hermes silently when intent is clear.
+- A delegated worker does not receive this Realtime conversation history. Include
+  every relevant fact already established here in the tool request: the named source
+  system, resolved people and addresses, message or record IDs, final reviewed
+  content, and the user's constraints. Never make it rediscover a known fact in an
+  unrelated system, or substitute another source merely because one lookup fails.
 - Use send_followup_to_hermes only when the user is continuing the same work.
 - Background work is completion-only by default: announce completion, failure,
   and approvals, but do not give periodic progress unless the user explicitly

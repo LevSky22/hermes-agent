@@ -37,6 +37,21 @@ def test_realtime_exposes_only_narrow_bridge_tools():
     ]
 
 
+def test_delegate_contract_requires_resolved_context_and_source_fidelity():
+    delegate = next(
+        tool for tool in REALTIME_TOOLS if tool["name"] == "delegate_to_hermes"
+    )
+    description = delegate["description"]
+    request_description = delegate["parameters"]["properties"]["request"][
+        "description"
+    ]
+
+    assert "does not receive this Realtime conversation history" in description
+    assert "source system" in description
+    assert "message or record IDs" in description
+    assert "facts already resolved" in request_description
+
+
 @pytest.mark.asyncio
 async def test_realtime_becomes_ready_only_after_session_updated():
     session = DiscordRealtimeSession(
