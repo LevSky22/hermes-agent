@@ -934,6 +934,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._realtime_playback_sources: Dict[int, Any] = {}
         self._realtime_playback_guard_until: Dict[int, float] = {}
         self._realtime_echo_guard_seconds: Dict[int, float] = {}
+        self._realtime_interruption_played_ms: Dict[int, int] = {}
         self._realtime_task_messages: Dict[tuple[int, str], Any] = {}
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
@@ -3997,7 +3998,27 @@ class DiscordAdapter(BasePlatformAdapter):
 
         async def _transcript(role: str, text: str) -> None:
             if role == "barge_in":
+                source = self._realtime_playback_sources.get(guild_id)
+                if source is not None:
+                    self._realtime_interruption_played_ms[guild_id] = source.played_ms
                 self._stop_realtime_voice_playback(guild_id)
+                return
+            if role == "barge_in_confirmed":
+                source = self._realtime_playback_sources.get(guild_id)
+                played_ms = self._realtime_interruption_played_ms.pop(guild_id, None)
+                if source is not None:
+                    played_ms = source.played_ms
+                self._stop_realtime_voice_playback(guild_id)
+                session = session_ref.get("session")
+                if session is not None and played_ms is not None:
+                    truncated = await session.truncate_response(played_ms)
+                    logger.info(
+                        "Discord Realtime barge-in confirmed "
+                        "(guild=%d played_ms=%d truncated=%s)",
+                        guild_id,
+                        played_ms,
+                        truncated,
+                    )
                 return
             if channel is None or not text:
                 return
@@ -4065,6 +4086,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._stop_realtime_voice_playback(guild_id)
         self._realtime_echo_guard_seconds.pop(guild_id, None)
         self._realtime_playback_guard_until.pop(guild_id, None)
+        self._realtime_interruption_played_ms.pop(guild_id, None)
         if session is None:
             return False
         await session.stop()

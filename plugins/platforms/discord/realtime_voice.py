@@ -242,6 +242,9 @@ class DiscordRealtimeSession:
         )
         self._announced_task_states: set[tuple[str, str]] = set()
         self._handled_call_ids: set[str] = set()
+        self._pending_tool_response = False
+        self._active_output_item_id: Optional[str] = None
+        self._active_output_content_index = 0
         self._input_gate_open = False
         self._last_loud_input_at = 0.0
         self._input_preroll: deque[bytes] = deque()
@@ -335,6 +338,18 @@ class DiscordRealtimeSession:
         if self._ws is not None and self._active_response:
             await self._send({"type": "response.cancel"})
         self._active_response = False
+
+    async def truncate_response(self, audio_end_ms: int) -> bool:
+        """Remove model audio that Discord had queued but never played."""
+        if self._ws is None or not self._active_output_item_id:
+            return False
+        await self._send({
+            "type": "conversation.item.truncate",
+            "item_id": self._active_output_item_id,
+            "content_index": self._active_output_content_index,
+            "audio_end_ms": max(0, int(audio_end_ms)),
+        })
+        return True
 
     async def notify_task_status(self, task: dict[str, Any]) -> None:
         """Queue important Hermes task transitions for a natural voice update."""
@@ -725,15 +740,24 @@ class DiscordRealtimeSession:
     async def _handle_event(self, event: dict[str, Any]) -> None:
         kind = str(event.get("type") or "")
         if kind == "input_audio_buffer.speech_started":
+            interrupted_response = self._active_response or self._barge_in_notified
             self._user_speaking = True
             logger.info("Discord Realtime VAD event: %s", kind)
-            if self.text_callback and not self._barge_in_notified:
+            if interrupted_response:
+                # The server cancels the active response because turn detection
+                # uses interrupt_response=true. Do not resume a tool continuation
+                # from the interrupted response over the user's new turn.
+                self._pending_tool_response = False
+            if self.text_callback and interrupted_response:
                 self._barge_in_notified = True
-                await self.text_callback("barge_in", "")
+                await self.text_callback("barge_in_confirmed", "")
             return
         if kind == "input_audio_buffer.speech_stopped":
             self._user_speaking = False
             self._reset_input_gate()
+            # Turn detection has create_response=true. Reserve the response
+            # slot immediately so a task update cannot race response.created.
+            self._active_response = True
             logger.info("Discord Realtime VAD event: %s", kind)
             return
         if kind == "session.updated":
@@ -749,10 +773,15 @@ class DiscordRealtimeSession:
         if kind == "response.created":
             self._active_response = True
             self._barge_in_notified = False
+            self._active_output_item_id = None
+            self._active_output_content_index = 0
             logger.info("Discord Realtime response event: %s", kind)
             return
         if kind == "response.output_item.added":
             self._active_response = True
+            item = event.get("item") or {}
+            if item.get("type") == "message" and item.get("id"):
+                self._active_output_item_id = str(item["id"])
             logger.info("Discord Realtime response event: %s", kind)
             return
         if kind == "conversation.item.input_audio_transcription.completed":
@@ -767,6 +796,10 @@ class DiscordRealtimeSession:
             delta = event.get("delta") or ""
             if delta:
                 self._active_response = True
+                if event.get("item_id"):
+                    self._active_output_item_id = str(event["item_id"])
+                if event.get("content_index") is not None:
+                    self._active_output_content_index = int(event["content_index"])
                 try:
                     pcm = base64.b64decode(delta)
                 except (ValueError, TypeError):
@@ -801,6 +834,11 @@ class DiscordRealtimeSession:
             for item in response.get("output") or []:
                 if item.get("type") == "function_call":
                     await self._handle_tool_call(item)
+            if self._pending_tool_response and not self._user_speaking:
+                self._pending_tool_response = False
+                self._active_response = True
+                await self._send({"type": "response.create"})
+                return
             await self._flush_task_announcements()
             return
         if kind == "error":
@@ -835,6 +873,12 @@ class DiscordRealtimeSession:
             },
         })
         if name == "wait_for_user":
+            return
+        if self._active_response:
+            # function_call_arguments.done arrives before response.done. Wait
+            # for that terminal event before asking for the continuation, or
+            # OpenAI rejects the overlapping response.create.
+            self._pending_tool_response = True
             return
         self._active_response = True
         await self._send({"type": "response.create"})

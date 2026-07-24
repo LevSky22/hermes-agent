@@ -168,6 +168,17 @@ def test_realtime_audio_source_flushes_partial_frame_once():
     assert source.read() == b""
 
 
+def test_realtime_audio_source_tracks_only_consumed_model_audio():
+    frame = b"\x01\x00" * (FRAME_SIZE // 2)
+    source = RealtimePCMQueueAudioSource(frame)
+    assert source.played_ms == 0
+    assert source.read() == frame
+    assert source.played_ms == 20
+    # Waiting silence is transport padding, not played model audio.
+    assert source.read() == b"\x00" * FRAME_SIZE
+    assert source.played_ms == 20
+
+
 def test_realtime_playback_guard_covers_active_source_and_tail():
     adapter = DiscordAdapter.__new__(DiscordAdapter)
     adapter._realtime_playback_sources = {1: MagicMock(closed=False)}
@@ -201,6 +212,44 @@ async def test_local_speech_gate_interrupts_playback_once():
     await asyncio.sleep(0)
 
     callback.assert_awaited_once_with("barge_in", "")
+
+
+@pytest.mark.asyncio
+async def test_server_vad_confirms_barge_in_and_reserves_new_response():
+    callback = AsyncMock()
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+        text_callback=callback,
+    )
+    session._active_response = True
+
+    await session._handle_event({"type": "input_audio_buffer.speech_started"})
+    callback.assert_awaited_once_with("barge_in_confirmed", "")
+    await session._handle_event({"type": "input_audio_buffer.speech_stopped"})
+    assert session._active_response is True
+
+
+@pytest.mark.asyncio
+async def test_realtime_truncates_unplayed_websocket_audio():
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=MagicMock(),
+        audio_callback=lambda _pcm: None,
+    )
+    session._ws = AsyncMock()
+    session._active_output_item_id = "item_audio"
+    session._active_output_content_index = 1
+
+    assert await session.truncate_response(460)
+    sent = json.loads(session._ws.send.await_args.args[0])
+    assert sent == {
+        "type": "conversation.item.truncate",
+        "item_id": "item_audio",
+        "content_index": 1,
+        "audio_end_ms": 460,
+    }
 
 
 def test_voice_mixer_stream_is_bounded_and_clears_on_overrun():
@@ -321,6 +370,35 @@ async def test_realtime_function_call_uses_broker_and_returns_output():
     sent = [json.loads(call.args[0]) for call in session._ws.send.await_args_list]
     assert sent[0]["item"]["type"] == "function_call_output"
     assert sent[1] == {"type": "response.create"}
+
+
+@pytest.mark.asyncio
+async def test_tool_continuation_waits_for_current_response_done():
+    broker = MagicMock()
+    broker.handle_tool = AsyncMock(return_value={"ok": True})
+    session = DiscordRealtimeSession(
+        api_key="key",
+        broker=broker,
+        audio_callback=lambda _pcm: None,
+    )
+    session._ws = AsyncMock()
+    session._active_response = True
+
+    await session._handle_event({
+        "type": "response.function_call_arguments.done",
+        "name": "delegate_to_hermes",
+        "call_id": "call_active",
+        "arguments": '{"request":"do it"}',
+    })
+    sent = [json.loads(call.args[0]) for call in session._ws.send.await_args_list]
+    assert len(sent) == 1
+    assert sent[0]["type"] == "conversation.item.create"
+    assert session._pending_tool_response is True
+
+    await session._handle_event({"type": "response.done", "response": {"output": []}})
+    sent = [json.loads(call.args[0]) for call in session._ws.send.await_args_list]
+    assert sent[-1] == {"type": "response.create"}
+    assert session._pending_tool_response is False
 
 
 @pytest.mark.asyncio
