@@ -824,6 +824,12 @@ class WebhookAdapter(BasePlatformAdapter):
                     route_config.get("deliver_extra", {}), payload
                 ),
                 "payload": payload,
+                "continuation_context": {
+                    "source_platform": "webhook",
+                    "source_route": route_name,
+                    "delivery_id": str(delivery_id),
+                    "event_type": str(event_type or ""),
+                },
             }
             logger.info(
                 "[webhook] direct-deliver event=%s route=%s target=%s msg_len=%d delivery=%s",
@@ -881,6 +887,13 @@ class WebhookAdapter(BasePlatformAdapter):
             "deliver_extra": self._render_delivery_extra(
                 route_config.get("deliver_extra", {}), payload
             ),
+            "continuation_context": {
+                "source_platform": "webhook",
+                "source_route": route_name,
+                "source_chat_id": session_chat_id,
+                "delivery_id": str(delivery_id),
+                "event_type": str(event_type or ""),
+            },
         }
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
@@ -1408,5 +1421,14 @@ class WebhookAdapter(BasePlatformAdapter):
         thread_id = extra.get("message_thread_id") or extra.get("thread_id")
         if thread_id:
             metadata = {"thread_id": thread_id}
+
+        # Discord can turn an operational alert into a durable conversation.
+        # Pass only bounded routing identifiers; the Discord adapter records
+        # them beside the delivered text and message ID. Never forward the raw
+        # webhook payload or originating agent transcript.
+        continuation_context = delivery.get("continuation_context")
+        if target_platform == Platform.DISCORD and isinstance(continuation_context, dict):
+            metadata = dict(metadata or {})
+            metadata["continuation_context"] = dict(continuation_context)
 
         return await adapter.send(chat_id, content, metadata=metadata)

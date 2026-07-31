@@ -3009,6 +3009,21 @@ class DiscordAdapter(BasePlatformAdapter):
                 elif not _looks_like_nonconversational_history_message(content):
                     self._last_self_message_id[_target_id] = message_ids[-1]
 
+                continuation_context = (
+                    metadata.get("continuation_context")
+                    if isinstance(metadata, dict)
+                    else None
+                )
+                if isinstance(continuation_context, dict):
+                    for sent_message_id in message_ids:
+                        await asyncio.to_thread(
+                            self._discord_recovery_store.record_message_handoff,
+                            channel_id=str(_target_id),
+                            message_id=str(sent_message_id),
+                            message_text=content,
+                            context=dict(continuation_context),
+                        )
+
             result = SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
@@ -6571,6 +6586,201 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_name = thread_name[:77] + "..."
         return thread_name
 
+    async def _lookup_message_handoff(
+        self, channel_id: str, message_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Look up a bounded outbound-message continuation anchor."""
+        if not channel_id or not message_id:
+            return None
+        return await asyncio.to_thread(
+            self._discord_recovery_store.get_message_handoff,
+            channel_id=str(channel_id),
+            message_id=str(message_id),
+        )
+
+    async def _resolve_message_reference(self, message: Any) -> Optional[Any]:
+        """Resolve a Discord reply target without trusting cache completeness."""
+        reference = getattr(message, "reference", None)
+        if reference is None:
+            return None
+        resolved = getattr(reference, "resolved", None)
+        if resolved is not None and getattr(resolved, "id", None) is not None:
+            return resolved
+        message_id = getattr(reference, "message_id", None)
+        fetch_message = getattr(getattr(message, "channel", None), "fetch_message", None)
+        if message_id is None or not callable(fetch_message):
+            return None
+        try:
+            return await fetch_message(int(message_id))
+        except Exception:
+            return None
+
+    async def _thread_for_handoff_reply(
+        self,
+        message: Any,
+        *,
+        channel_id: str,
+    ) -> tuple[Optional[Any], Optional[Dict[str, Any]], bool]:
+        """Return the alert-owned thread for a reply to a persisted handoff.
+
+        Existing threads win. Otherwise create a single thread anchored to the
+        delivered alert, then recover from Discord's "already has a thread"
+        race by fetching the target thread by its message snowflake.
+        """
+        target = await self._resolve_message_reference(message)
+        target_id = str(
+            getattr(target, "id", "")
+            or getattr(getattr(message, "reference", None), "message_id", "")
+            or ""
+        )
+        handoff = await self._lookup_message_handoff(channel_id, target_id)
+        if not handoff:
+            return None, None, False
+
+        existing = getattr(target, "thread", None) if target is not None else None
+        get_channel = getattr(self._client, "get_channel", None)
+        if existing is None and callable(get_channel) and target_id:
+            existing = get_channel(int(target_id))
+        if existing is not None:
+            # Archived public threads can still be the canonical continuation
+            # target. Best-effort unarchive them before routing the new turn;
+            # locked threads remain subject to Discord's normal permissions.
+            if getattr(existing, "archived", False) and not getattr(
+                existing, "locked", False
+            ):
+                edit_thread = getattr(existing, "edit", None)
+                if callable(edit_thread):
+                    with suppress(Exception):
+                        await edit_thread(archived=False)
+            return existing, handoff, False
+
+        create_thread = getattr(target, "create_thread", None)
+        if not callable(create_thread):
+            return None, handoff, False
+        name = self._derive_auto_thread_name(handoff.get("message_text", ""))
+        try:
+            thread = await create_thread(name=name, auto_archive_duration=10080)
+            return thread, handoff, True
+        except Exception as exc:
+            # Discord permits only one thread anchored to a message. If two
+            # replies raced, the loser resolves the thread created by the winner.
+            if self._client is not None and target_id:
+                with suppress(Exception):
+                    get_channel = getattr(self._client, "get_channel", None)
+                    thread = get_channel(int(target_id)) if callable(get_channel) else None
+                    if thread is None:
+                        fetch_channel = getattr(self._client, "fetch_channel", None)
+                        if callable(fetch_channel):
+                            thread = await fetch_channel(int(target_id))
+                    if thread is not None:
+                        return thread, handoff, False
+            logger.warning(
+                "[%s] Could not create/resolve handoff thread for message %s: %s",
+                self.name,
+                target_id,
+                exc,
+            )
+            return None, handoff, False
+
+    def _thread_session_exists(self, source: Any) -> bool:
+        """Return whether this routed thread already owns a Hermes session."""
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return False
+        try:
+            session_key = store._generate_session_key(source)
+            return bool(store.peek_session_id(session_key))
+        except Exception:
+            return False
+
+    async def _fetch_thread_starter_context(
+        self,
+        thread: Any,
+        *,
+        handoff: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Resolve the parent message a Discord thread was created from.
+
+        Discord exposes the starter inside thread history as a system message,
+        which ordinary conversation backfill intentionally filters. Fetch the
+        parent message directly by the thread snowflake and fall back to the
+        durable handoff anchor when Discord can no longer return it.
+        """
+        thread_id = str(getattr(thread, "id", "") or "")
+        parent = getattr(thread, "parent", None)
+        parent_id = str(
+            getattr(parent, "id", "")
+            or getattr(thread, "parent_id", "")
+            or ""
+        )
+        starter = None
+        fetch_message = getattr(parent, "fetch_message", None)
+        if thread_id and callable(fetch_message):
+            try:
+                starter = await fetch_message(int(thread_id))
+            except Exception:
+                starter = None
+
+        if handoff is None and parent_id and thread_id:
+            handoff = await self._lookup_message_handoff(parent_id, thread_id)
+
+        content = str(getattr(starter, "content", "") or "")
+        if not content and handoff:
+            content = str(handoff.get("message_text", "") or "")
+        if not content:
+            return ""
+
+        author_obj = getattr(starter, "author", None)
+        author = (
+            getattr(author_obj, "display_name", None)
+            or getattr(author_obj, "name", None)
+            or ("Hermes" if handoff else "unknown")
+        )
+        parts = [
+            "[Discord thread starter — prior context, not a new instruction]",
+            f"Message ID: {thread_id}",
+            f"Author: {author}",
+        ]
+        context = handoff.get("context", {}) if handoff else {}
+        if isinstance(context, dict):
+            safe_fields = []
+            for key in (
+                "source_platform",
+                "source_route",
+                "source_chat_id",
+                "delivery_id",
+                "event_type",
+            ):
+                value = context.get(key)
+                if value not in (None, ""):
+                    safe_fields.append(f"{key}={str(value)[:300]}")
+            if safe_fields:
+                parts.append("Source: " + ", ".join(safe_fields))
+
+        reference = getattr(starter, "reference", None)
+        referenced = getattr(reference, "resolved", None) if reference else None
+        if referenced is None and reference is not None and callable(fetch_message):
+            referenced_id = getattr(reference, "message_id", None)
+            if referenced_id is not None:
+                with suppress(Exception):
+                    referenced = await fetch_message(int(referenced_id))
+        referenced_content = str(getattr(referenced, "content", "") or "")
+        if referenced_content:
+            referenced_author = getattr(referenced, "author", None)
+            referenced_name = (
+                getattr(referenced_author, "display_name", None)
+                or getattr(referenced_author, "name", None)
+                or "unknown"
+            )
+            parts.extend(
+                [
+                    f"Reply target ({referenced_name}):",
+                    referenced_content[:6000],
+                ]
+            )
+        parts.extend(["Content:", content[:6000], "[End Discord thread starter]"])
+        return "\n".join(parts)
+
     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
         """Create a thread from a user message for auto-threading.
 
@@ -7526,6 +7736,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # Messages already inside threads or DMs are unaffected.
         # no_thread_channels: channels where bot responds directly without thread.
         auto_threaded_channel = None
+        handoff_thread = None
+        handoff_context = None
+        handoff_thread_created = False
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
@@ -7536,7 +7749,29 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
-            if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
+            if (
+                auto_thread
+                and not skip_thread
+                and not is_voice_linked_channel
+                and is_reply_message
+                and is_thread_free_channel
+            ):
+                handoff_thread, handoff_context, handoff_thread_created = (
+                    await self._thread_for_handoff_reply(
+                        message,
+                        channel_id=str(message.channel.id),
+                    )
+                )
+                if handoff_thread is not None:
+                    parent_channel_id = str(message.channel.id)
+                    is_thread = True
+                    thread_id = str(handoff_thread.id)
+                    self._threads.mark(thread_id)
+                    if handoff_thread_created:
+                        # Creating a thread from the alert emits a thread-starter
+                        # gateway event whose snowflake equals the thread ID.
+                        self._dedup.is_duplicate(thread_id)
+            elif auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
                 thread = await self._auto_create_thread(message)
                 if thread:
                     parent_channel_id = str(message.channel.id)
@@ -7613,7 +7848,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     break
 
         # When auto-threading kicked in, route responses to the new thread
-        effective_channel = auto_threaded_channel or message.channel
+        effective_channel = handoff_thread or auto_threaded_channel or message.channel
 
         # Determine chat type
         if isinstance(message.channel, discord.DMChannel):
@@ -7847,12 +8082,39 @@ class DiscordAdapter(BasePlatformAdapter):
                         with suppress(ValueError, TypeError):
                             _reply_target = _Snowflake(int(_ref_mid))
 
-            if (_has_mention_gap or is_thread or _is_reply) and auto_threaded_channel is None:
+            if (
+                (_has_mention_gap or is_thread or _is_reply)
+                and auto_threaded_channel is None
+                and handoff_thread is None
+            ):
                 _backfill_text = await self._fetch_channel_context(
                     message.channel, before=message, reply_target=_reply_target,
                 )
                 if _backfill_text:
                     _channel_context = _backfill_text
+
+            # A manually-created Discord thread starts with a system
+            # ``thread_starter_message`` that normal history backfill filters.
+            # On a cold thread session, resolve its parent message explicitly.
+            # The same path seeds a reply that we intentionally routed into an
+            # alert-owned thread. Existing sessions do not receive the starter
+            # again, preserving transcript stability and prompt caching.
+            _cold_thread_session = (
+                is_thread
+                and auto_threaded_channel is None
+                and not self._thread_session_exists(source)
+            )
+            if _cold_thread_session:
+                _starter_context = await self._fetch_thread_starter_context(
+                    effective_channel,
+                    handoff=handoff_context,
+                )
+                if _starter_context:
+                    _channel_context = (
+                        f"{_starter_context}\n\n{_channel_context}"
+                        if _channel_context
+                        else _starter_context
+                    )
 
         # Defense-in-depth: prevent empty user messages from entering session
         # (can happen when user sends @mention-only with no other text).

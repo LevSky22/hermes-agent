@@ -781,14 +781,14 @@ class TestRawTemplateToken:
 class TestDeliverCrossPlatformThreadId:
     """Tests for thread_id passthrough in _deliver_cross_platform."""
 
-    def _setup_adapter_with_mock_target(self):
+    def _setup_adapter_with_mock_target(self, platform: str = "telegram"):
         """Set up a webhook adapter with a mocked gateway_runner and target adapter."""
         adapter = _make_adapter()
         mock_target = AsyncMock()
         mock_target.send = AsyncMock(return_value=SendResult(success=True))
 
         mock_runner = MagicMock()
-        mock_runner.adapters = {Platform("telegram"): mock_target}
+        mock_runner.adapters = {Platform(platform): mock_target}
         mock_runner.config.get_home_channel.return_value = None
 
         adapter.gateway_runner = mock_runner
@@ -807,6 +807,27 @@ class TestDeliverCrossPlatformThreadId:
         await adapter._deliver_cross_platform("telegram", "hello", delivery)
         mock_target.send.assert_awaited_once_with(
             "12345", "hello", metadata={"thread_id": "999"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_discord_receives_bounded_continuation_metadata(self):
+        adapter, mock_target = self._setup_adapter_with_mock_target("discord")
+        continuation = {
+            "source_platform": "webhook",
+            "source_route": "operations-alert",
+            "delivery_id": "delivery-1",
+        }
+        delivery = {
+            "deliver_extra": {"chat_id": "12345"},
+            "continuation_context": continuation,
+        }
+
+        await adapter._deliver_cross_platform("discord", "hello", delivery)
+
+        mock_target.send.assert_awaited_once_with(
+            "12345",
+            "hello",
+            metadata={"continuation_context": continuation},
         )
 
 

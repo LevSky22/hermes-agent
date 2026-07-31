@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import os
 import sqlite3
@@ -17,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 _DB_FILENAME = "discord_message_recovery.db"
 _RETENTION_DAYS = 30
+_HANDOFF_TEXT_MAX_CHARS = 6000
+_HANDOFF_CONTEXT_MAX_CHARS = 2000
 
 
 class DiscordRecoveryStore:
@@ -97,6 +100,15 @@ class DiscordRecoveryStore:
                 updated_at TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS discord_message_handoffs (
+                message_id TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL,
+                message_text TEXT NOT NULL,
+                context_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            )
+        """)
         cutoff = (
             dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=_RETENTION_DAYS)
         ).isoformat()
@@ -110,3 +122,86 @@ class DiscordRecoveryStore:
             "DELETE FROM discord_recovery_cursors WHERE updated_at < ?",
             (cutoff,),
         )
+        conn.execute(
+            "DELETE FROM discord_message_handoffs WHERE created_at < ?",
+            (cutoff,),
+        )
+
+    def record_message_handoff(
+        self,
+        *,
+        channel_id: str,
+        message_id: str,
+        message_text: str,
+        context: dict[str, Any] | None = None,
+    ) -> bool:
+        """Persist a bounded continuation anchor for one outbound message.
+
+        The record contains only the delivered text and caller-supplied routing
+        identifiers. It deliberately does not copy the originating agent
+        transcript or webhook payload.
+        """
+        if not channel_id or not message_id or not message_text:
+            return False
+        bounded_text = str(message_text)[:_HANDOFF_TEXT_MAX_CHARS]
+        try:
+            context_json = json.dumps(
+                context if isinstance(context, dict) else {},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            context_json = "{}"
+        if len(context_json) > _HANDOFF_CONTEXT_MAX_CHARS:
+            context_json = "{}"
+        created_at = dt.datetime.now(dt.timezone.utc).isoformat()
+
+        def _op(conn: sqlite3.Connection) -> bool:
+            conn.execute(
+                """
+                INSERT INTO discord_message_handoffs
+                    (message_id, channel_id, message_text, context_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    channel_id=excluded.channel_id,
+                    message_text=excluded.message_text,
+                    context_json=excluded.context_json,
+                    created_at=excluded.created_at
+                """,
+                (str(message_id), str(channel_id), bounded_text, context_json, created_at),
+            )
+            return True
+
+        return bool(self.call(_op, False))
+
+    def get_message_handoff(
+        self, *, channel_id: str, message_id: str
+    ) -> dict[str, Any] | None:
+        """Return a continuation anchor only from its original channel."""
+        if not channel_id or not message_id:
+            return None
+
+        def _op(conn: sqlite3.Connection):
+            return conn.execute(
+                """
+                SELECT message_text, context_json, created_at
+                FROM discord_message_handoffs
+                WHERE message_id=? AND channel_id=?
+                """,
+                (str(message_id), str(channel_id)),
+            ).fetchone()
+
+        row = self.call(_op)
+        if not row:
+            return None
+        try:
+            context = json.loads(row[1]) if row[1] else {}
+        except (TypeError, ValueError):
+            context = {}
+        if not isinstance(context, dict):
+            context = {}
+        return {
+            "message_text": row[0],
+            "context": context,
+            "created_at": row[2],
+        }

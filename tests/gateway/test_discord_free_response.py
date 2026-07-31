@@ -253,6 +253,137 @@ async def test_discord_reply_message_skips_auto_thread(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_discord_handoff_reply_uses_existing_alert_thread(adapter, monkeypatch):
+    """A reply to a persisted operational alert continues in its thread."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", "123")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    parent = FakeTextChannel(channel_id=123)
+    alert_thread = FakeThread(channel_id=500, name="Operational alert", parent=parent)
+    alert = SimpleNamespace(
+        id=500,
+        content="Operational alert — account update; resource task-42",
+        author=adapter._client.user,
+        thread=alert_thread,
+        reference=None,
+    )
+    parent.fetch_message = AsyncMock(return_value=alert)
+    adapter._lookup_message_handoff = AsyncMock(return_value={
+        "message_text": alert.content,
+        "context": {
+            "source_platform": "webhook",
+            "source_route": "operations-alert",
+            "delivery_id": "delivery-1",
+        },
+    })
+
+    message = make_message(
+        channel=parent,
+        content="pull the latest email and draft a reply",
+        msg_type=discord_platform.discord.MessageType.reply,
+    )
+    message.reference = SimpleNamespace(message_id=500, resolved=alert)
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+    assert event.source.chat_id == "500"
+    assert event.source.parent_chat_id == "123"
+    assert "Operational alert — account update" in event.channel_context
+    assert "source_route=operations-alert" in event.channel_context
+
+
+@pytest.mark.asyncio
+async def test_discord_handoff_reply_creates_thread_on_alert(adapter, monkeypatch):
+    """The first reply creates one thread anchored to the alert, not the reply."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", "123")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    parent = FakeTextChannel(channel_id=123)
+    created_thread = FakeThread(channel_id=600, name="Operational alert", parent=parent)
+    alert = SimpleNamespace(
+        id=600,
+        content="Operational alert — one account needs a reply",
+        author=adapter._client.user,
+        thread=None,
+        reference=None,
+        create_thread=AsyncMock(return_value=created_thread),
+    )
+    parent.fetch_message = AsyncMock(return_value=alert)
+    adapter._lookup_message_handoff = AsyncMock(return_value={
+        "message_text": alert.content,
+        "context": {"source_platform": "webhook"},
+    })
+
+    message = make_message(
+        channel=parent,
+        content="draft the response",
+        msg_type=discord_platform.discord.MessageType.reply,
+    )
+    message.reference = SimpleNamespace(message_id=600, resolved=alert)
+
+    await adapter._handle_message(message)
+
+    alert.create_thread.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "600"
+    assert event.source.chat_type == "thread"
+    assert "one account needs a reply" in event.channel_context
+
+
+@pytest.mark.asyncio
+async def test_discord_cold_manual_thread_hydrates_parent_starter(adapter, monkeypatch):
+    """A manual thread inherits the parent message on its first Hermes turn."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", "123")
+
+    parent = FakeTextChannel(channel_id=123)
+    starter = SimpleNamespace(
+        id=700,
+        content="Assistant response about subscription terms",
+        author=adapter._client.user,
+        reference=None,
+    )
+    parent.fetch_message = AsyncMock(return_value=starter)
+    thread = FakeThread(channel_id=700, name="subscription", parent=parent)
+    adapter._lookup_message_handoff = AsyncMock(return_value=None)
+
+    message = make_message(channel=thread, content="please draft the reply")
+    await adapter._handle_message(message)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "700"
+    assert "Assistant response about subscription terms" in event.channel_context
+    assert "prior context, not a new instruction" in event.channel_context
+
+
+@pytest.mark.asyncio
+async def test_discord_existing_thread_session_does_not_reinject_starter(adapter, monkeypatch):
+    """Starter hydration is cold-session-only so cached prefixes stay stable."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_FREE_RESPONSE_CHANNELS", "123")
+
+    parent = FakeTextChannel(channel_id=123)
+    parent.fetch_message = AsyncMock()
+    thread = FakeThread(channel_id=800, name="existing", parent=parent)
+    adapter._session_store = SimpleNamespace(
+        _generate_session_key=lambda source: "thread-key",
+        peek_session_id=lambda key: "existing-session",
+    )
+
+    message = make_message(channel=thread, content="continue")
+    await adapter._handle_message(message)
+
+    parent.fetch_message.assert_not_awaited()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.channel_context is None
+
+
+@pytest.mark.asyncio
 async def test_discord_voice_linked_channel_skips_mention_requirement_and_auto_thread(adapter, monkeypatch):
     """Active voice-linked text channels should behave like free-response channels."""
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
