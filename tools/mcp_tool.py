@@ -5361,6 +5361,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         if gate_error is not None:
             return gate_error
 
+        # Capture the invoking agent/gateway context before crossing onto the
+        # dedicated MCP event-loop thread.  The task created on that loop does
+        # not reliably inherit the scheduling thread's ContextVars (notably
+        # HERMES_SESSION_PLATFORM and the approval session key), especially
+        # through the MCP SDK 2.x multi-round input_required path.
+        call_context = contextvars.copy_context()
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -5423,11 +5429,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
-                # Snapshot the agent's context so an elicitation callback
-                # triggered during this call (fired on the MCP recv loop
-                # task, which doesn't inherit our contextvars) can replay
-                # it and detect the gateway platform / session for routing.
-                server._pending_call_context = contextvars.copy_context()
+                # Publish the context captured synchronously at handler entry
+                # so an elicitation callback triggered during this call can
+                # replay it and detect the gateway platform/session.
+                server._pending_call_context = call_context
                 try:
                     result = await server.session.call_tool(tool_name, arguments=args)
                 finally:

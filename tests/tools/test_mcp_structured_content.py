@@ -1,6 +1,7 @@
 """Tests for MCP tool structuredContent preservation."""
 
 import asyncio
+import contextvars
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -107,3 +108,43 @@ class TestStructuredContentPreservation:
         raw = handler({})
         data = json.loads(raw)
         assert data["result"] == payload
+
+
+def test_tool_handler_captures_context_before_mcp_loop_handoff():
+    """MCP 2.x input_required callbacks retain the gateway call context."""
+    probe = contextvars.ContextVar("mcp_gateway_probe", default="")
+    fake_server = SimpleNamespace(session=MagicMock(), _rpc_lock=None)
+
+    async def call_tool(_name, arguments):
+        captured = fake_server._pending_call_context
+        assert captured is not None
+        assert captured.get(probe) == "discord-session"
+        return _FakeCallToolResult(content=[_FakeContentBlock("ok")])
+
+    fake_server.session.call_tool = call_tool
+
+    def run_on_empty_context(coro_or_factory, timeout=30):
+        coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+
+        def run():
+            loop = asyncio.new_event_loop()
+            try:
+                async def install_lock_and_run():
+                    fake_server._rpc_lock = asyncio.Lock()
+                    return await coro
+
+                return loop.run_until_complete(install_lock_and_run())
+            finally:
+                loop.close()
+
+        return contextvars.Context().run(run)
+
+    token = probe.set("discord-session")
+    try:
+        with patch.dict(mcp_tool._servers, {"test-server": fake_server}), patch(
+            "tools.mcp_tool._run_on_mcp_loop", side_effect=run_on_empty_context
+        ):
+            handler = mcp_tool._make_tool_handler("test-server", "my-tool", 30.0)
+            assert json.loads(handler({})) == {"result": "ok"}
+    finally:
+        probe.reset(token)
