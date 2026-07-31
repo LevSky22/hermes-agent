@@ -412,6 +412,16 @@ class TestDeliverResultWrapping:
         text_sent = adapter.send.call_args[0][1]
         assert "MEDIA:" not in text_sent
         assert "Here is TTS" in text_sent
+        continuation = adapter.send.call_args.kwargs["metadata"]["continuation_context"]
+        assert continuation == {
+            "source_platform": "cron",
+            "source_route": "cron_delivery",
+            "source_chat_id": "9876",
+            "delivery_id": "cron:tts-job",
+            "event_type": "cron_result",
+            "job_id": "tts-job",
+            "job_name": "tts-job",
+        }
 
         # Audio file should be sent as a voice attachment
         adapter.send_voice.assert_called_once()
@@ -1899,5 +1909,4 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
 

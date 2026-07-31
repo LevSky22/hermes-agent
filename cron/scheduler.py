@@ -1772,6 +1772,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
 
+            # Discord replies to scheduled operational messages need the same
+            # bounded continuation anchor as webhook deliveries.  Persist the
+            # rendered message plus routing identifiers at send time so a reply
+            # can open (or re-use) the alert-owned thread without importing the
+            # cron execution transcript into the conversation.
+            if platform == Platform.DISCORD:
+                route_metadata["continuation_context"] = {
+                    "source_platform": "cron",
+                    "source_route": "cron_delivery",
+                    "source_chat_id": str(chat_id),
+                    "delivery_id": f"cron:{job['id']}",
+                    "event_type": "cron_result",
+                    "job_id": str(job["id"]),
+                    "job_name": str(job.get("name") or job["id"]),
+                }
+
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
                 # Route through the gateway's DeliveryRouter so the live send
