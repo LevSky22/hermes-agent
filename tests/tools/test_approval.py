@@ -16,12 +16,41 @@ from tools.approval import (
     _normalize_approval_mode,
     _smart_approve,
     approve_session,
+    classify_destructive_consent,
     detect_dangerous_command,
     detect_hardline_command,
     is_approved,
     load_permanent,
     prompt_dangerous_approval,
 )
+
+
+class TestDestructiveConsentClassifier:
+    def test_parses_strict_structured_approval(self):
+        response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            content='{"decision":"approve","refers_to_pending_action":true,"reason_code":"explicit"}'
+        ))])
+        with mock_patch("agent.auxiliary_client.call_llm", return_value=response) as call:
+            result = classify_destructive_consent(
+                "effect=destructive tool=delete_record target=123",
+                "Yes, delete that specific record.",
+            )
+        assert result == {
+            "decision": "approve",
+            "refers_to_pending_action": True,
+            "reason_code": "explicit",
+        }
+        sent = call.call_args.kwargs["messages"]
+        assert "delete that specific record" in sent[1]["content"]
+
+    def test_malformed_output_fails_closed(self):
+        response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            content="APPROVE"
+        ))])
+        with mock_patch("agent.auxiliary_client.call_llm", return_value=response):
+            result = classify_destructive_consent("delete record 123", "sure")
+        assert result["decision"] == "uncertain"
+        assert result["refers_to_pending_action"] is False
 
 
 class TestApprovalModeParsing:

@@ -92,6 +92,20 @@ def _register_blocking_approval(runner):
     return session_key, entry
 
 
+def _register_destructive_approval(runner, *, requester="u1"):
+    from tools.approval import _ApprovalEntry, _gateway_queues
+
+    source = _make_source()
+    session_key = runner._session_key_for_source(source)
+    entry = _ApprovalEntry({
+        "command": "effect=destructive client=example tool=proxy_request method=DELETE path=/records/123",
+        "approval_kind": "destructive",
+        "requester_user_id": requester,
+    })
+    _gateway_queues.setdefault(session_key, []).append(entry)
+    return session_key, entry
+
+
 @pytest.mark.parametrize("reply", ["yes", "approve", "ok", "y", "confirm"])
 def test_plaintext_yes_resolves_approval(reply):
     _clear_approval_state()
@@ -126,10 +140,70 @@ def test_no_pending_approval_does_not_consume_conversational_yes():
 
     # No approval existed, so nothing was resolved — the "yes" is treated
     # as ordinary text, not as a dangerous-command approval (design intent).
-    # (It still flows through normal busy handling, which may send a busy
-    # ack; the contract here is only that no approval was consumed.)
     from tools.approval import _gateway_queues
     assert session_key not in _gateway_queues
     _clear_approval_state()
 
 
+def test_destructive_natural_language_uses_classifier(monkeypatch):
+    _clear_approval_state()
+    runner, adapter = _make_runner()
+    session_key, entry = _register_destructive_approval(runner)
+    monkeypatch.setattr(
+        "gateway.run._classify_destructive_consent",
+        AsyncMock(return_value={
+            "decision": "approve",
+            "refers_to_pending_action": True,
+            "reason_code": "explicit",
+        }),
+    )
+    handled = asyncio.run(runner._handle_active_session_busy_message(
+        _make_event("Yes, delete that one record"), session_key,
+    ))
+
+    assert handled is True
+    assert entry.result == "once"
+    assert entry.event.is_set()
+    adapter._send_with_retry.assert_awaited()
+    _clear_approval_state()
+
+
+def test_destructive_ambiguous_text_fails_closed(monkeypatch):
+    _clear_approval_state()
+    runner, adapter = _make_runner()
+    session_key, entry = _register_destructive_approval(runner)
+    monkeypatch.setattr(
+        "gateway.run._classify_destructive_consent",
+        AsyncMock(return_value={
+            "decision": "uncertain",
+            "refers_to_pending_action": False,
+            "reason_code": "ambiguous",
+        }),
+    )
+
+    handled = asyncio.run(
+        runner._handle_active_session_busy_message(_make_event("sure"), session_key)
+    )
+
+    assert handled is True
+    assert entry.result is None
+    assert not entry.event.is_set()
+    assert "Confirm once" in adapter._send_with_retry.await_args.kwargs["content"]
+    _clear_approval_state()
+
+
+def test_destructive_approval_rejects_different_user(monkeypatch):
+    _clear_approval_state()
+    runner, _adapter = _make_runner()
+    session_key, entry = _register_destructive_approval(runner, requester="owner")
+    classifier = AsyncMock()
+    monkeypatch.setattr("gateway.run._classify_destructive_consent", classifier)
+    handled = asyncio.run(
+        runner._handle_active_session_busy_message(_make_event("delete it"), session_key)
+    )
+
+    assert handled is True
+    classifier.assert_not_awaited()
+    assert entry.result is None
+    assert not entry.event.is_set()
+    _clear_approval_state()

@@ -5208,7 +5208,8 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
+            get_pending_gateway_approval, resolve_gateway_approval,
+            has_blocking_approval,
         )
 
         if not has_blocking_approval(session_key):
@@ -5221,6 +5222,32 @@ class GatewaySlashCommandsMixin:
         args = event.get_command_args().strip().lower().split()
         resolve_all = "all" in args
         remaining = [a for a in args if a != "all"]
+
+        destructive = get_pending_gateway_approval(
+            session_key, approval_kind="destructive",
+        )
+        if destructive is not None:
+            requester = str(destructive.get("requester_user_id") or "")
+            speaker = str(source.user_id or "")
+            if not requester or speaker != requester:
+                return "Only the person who requested this destructive action can approve it."
+            if resolve_all or remaining:
+                return (
+                    "Destructive actions can only be confirmed once. "
+                    "Use `/approve` without modifiers or the Confirm once button."
+                )
+            count = resolve_gateway_approval(
+                session_key,
+                "once",
+                approval_id=str(destructive.get("approval_id") or ""),
+                requester_user_id=speaker,
+            )
+            if not count:
+                return t("gateway.approve.no_pending")
+            _adapter = self.adapters.get(source.platform)
+            if _adapter:
+                _adapter.resume_typing_for_chat(source.chat_id)
+            return "Confirmed once. Continuing with that action."
 
         if any(a in {"always", "permanent", "permanently"} for a in remaining):
             choice = "always"
@@ -5257,7 +5284,8 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
+            get_pending_gateway_approval, resolve_gateway_approval,
+            has_blocking_approval,
         )
 
         if not has_blocking_approval(session_key):
@@ -5279,6 +5307,28 @@ class GatewaySlashCommandsMixin:
         # Cap to a sane one-liner; the agent only needs a short hint.
         if reason:
             reason = reason[:280].strip()
+
+        destructive = get_pending_gateway_approval(
+            session_key, approval_kind="destructive",
+        )
+        if destructive is not None:
+            requester = str(destructive.get("requester_user_id") or "")
+            speaker = str(source.user_id or "")
+            if not requester or speaker != requester:
+                return "Only the person who requested this destructive action can cancel it."
+            count = resolve_gateway_approval(
+                session_key,
+                "deny",
+                reason=reason or None,
+                approval_id=str(destructive.get("approval_id") or ""),
+                requester_user_id=speaker,
+            )
+            if not count:
+                return t("gateway.deny.no_pending")
+            _adapter = self.adapters.get(source.platform)
+            if _adapter:
+                _adapter.resume_typing_for_chat(source.chat_id)
+            return "Cancelled. That action will not run."
 
         count = resolve_gateway_approval(
             session_key, "deny", resolve_all=resolve_all,

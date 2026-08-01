@@ -6793,6 +6793,9 @@ class DiscordAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        approval_id: Optional[str] = None,
+        approval_kind: Optional[str] = None,
+        requester_user_id: Optional[str] = None,
     ) -> SendResult:
         """
         Send a button-based exec approval prompt for a dangerous command.
@@ -6823,10 +6826,15 @@ class DiscordAdapter(BasePlatformAdapter):
             if len(reason_display) > reason_budget:
                 reason_display = reason_display[: reason_budget - 15] + "... [truncated]"
 
+            destructive = approval_kind == "destructive"
             prompt_prefix = (
-                "⚠️ **Command Approval Required**\n\n"
-                "Do you want Hermes to run this command?\n\n"
-                "**Requested command:**\n```bash\n"
+                ("🛑 **Destructive Action Approval Required**\n\n"
+                 "Confirm this exact action once?\n\n"
+                 "**Requested action:**\n```\n")
+                if destructive else
+                ("⚠️ **Command Approval Required**\n\n"
+                 "Do you want Hermes to run this command?\n\n"
+                 "**Requested command:**\n```bash\n")
             )
             if smart_denied:
                 prompt_prefix += "**Smart DENY:** owner override applies to this one operation only.\n\n"
@@ -6869,6 +6877,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 allow_permanent=allow_permanent,
                 allow_session=allow_session,
                 smart_denied=smart_denied,
+                approval_id=approval_id,
+                requester_user_id=requester_user_id,
+                destructive=destructive,
             )
 
             send_kwargs: Dict[str, Any] = {"content": content, "embed": embed, "view": view}
@@ -8134,9 +8145,14 @@ def _define_discord_view_classes() -> None:
             allow_permanent: bool = True,
             allow_session: bool = True,
             smart_denied: bool = False,
+            approval_id: Optional[str] = None,
+            requester_user_id: Optional[str] = None,
+            destructive: bool = False,
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
+            self.approval_id = approval_id
+            self.requester_user_id = str(requester_user_id or "")
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             # Opt-in admin gate for exec approval (default off → user-scope,
@@ -8147,11 +8163,26 @@ def _define_discord_view_classes() -> None:
                 str(a).strip() for a in (admin_user_ids or set()) if str(a).strip()
             }
             self.resolved = False
+            def _remove_button(button) -> None:
+                remover = getattr(self, "remove_item", None)
+                if callable(remover):
+                    remover(button)
+                elif button in self.children:  # lightweight test/fallback view
+                    self.children.remove(button)
+            if destructive:
+                for child in self.children:
+                    if child.label == "Allow Once":
+                        child.label = "Confirm once"
+                    elif child.label == "Deny":
+                        child.label = "Cancel"
             if smart_denied or not allow_session:
-                self.remove_item(self.allow_session)
-                self.remove_item(self.allow_always)
+                for child in list(self.children):
+                    if child.label in {"Allow Session", "Always Allow"}:
+                        _remove_button(child)
             elif not allow_permanent:
-                self.remove_item(self.allow_always)
+                for child in list(self.children):
+                    if child.label == "Always Allow":
+                        _remove_button(child)
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             """Verify the user clicking is authorized.
@@ -8203,6 +8234,12 @@ def _define_discord_view_classes() -> None:
                 )
                 return
 
+            if self.requester_user_id and str(interaction.user.id) != self.requester_user_id:
+                await interaction.response.send_message(
+                    "Only the person who requested this action can approve it.", ephemeral=True
+                )
+                return
+
             self.resolved = True
 
             # Unblock the waiting agent thread FIRST, then render the outcome.
@@ -8210,7 +8247,12 @@ def _define_discord_view_classes() -> None:
             # must not claim "Approved" — the command was already denied.
             try:
                 from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice)
+                count = resolve_gateway_approval(
+                    self.session_key,
+                    choice,
+                    approval_id=self.approval_id,
+                    requester_user_id=str(interaction.user.id),
+                )
                 logger.info(
                     "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                     count, self.session_key, choice, interaction.user.display_name,

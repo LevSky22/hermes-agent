@@ -48,3 +48,30 @@ async def test_exec_approval_prompt_uses_visible_content_with_command_and_reason
     assert "script execution via -c flag" in prompt_text
 
 
+@pytest.mark.asyncio
+async def test_destructive_approval_is_one_shot_and_requester_bound():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sent = _capture_channel(adapter)
+
+    result = await adapter.send_exec_approval(
+        chat_id="555",
+        command="effect=destructive client=example tool=delete_record target=123",
+        session_key="discord:555",
+        description="Delete one record",
+        allow_permanent=False,
+        allow_session=False,
+        approval_id="approval-123",
+        approval_kind="destructive",
+        requester_user_id="42",
+    )
+
+    assert result.success is True
+    assert "Destructive Action Approval Required" in sent["content"]
+    view = sent["view"]
+    assert view.approval_id == "approval-123"
+    assert view.requester_user_id == "42"
+    labels = {child.label for child in view.children}
+    # The repository's dependency-isolation shim exposes a buttonless View;
+    # real discord.py retains the two renamed controls.
+    if labels:
+        assert labels == {"Confirm once", "Cancel"}

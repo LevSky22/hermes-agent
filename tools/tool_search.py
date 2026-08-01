@@ -1002,7 +1002,14 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
         return None, {}, "tool_call requires a 'name' argument"
     if name in BRIDGE_TOOL_NAMES:
         return None, {}, f"tool_call cannot invoke '{name}' (it is itself a bridge tool)"
-    raw_args = args.get("arguments")
+    has_arguments = "arguments" in args
+    has_parameters = "parameters" in args
+    if has_arguments and has_parameters:
+        return None, {}, "tool_call must not provide both 'arguments' and 'parameters'"
+    # Some OpenAI-compatible providers emit the JSON-schema term
+    # ``parameters`` for a deferred invocation.  Accept that shape only as an
+    # unambiguous alias; the canonical public contract remains ``arguments``.
+    raw_args = args.get("arguments") if has_arguments else args.get("parameters")
     if raw_args is None:
         raw_args = {}
     if isinstance(raw_args, str):

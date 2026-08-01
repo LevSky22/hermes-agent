@@ -2270,6 +2270,15 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+async def _classify_destructive_consent(action_summary: str, utterance: str) -> dict:
+    """Run the isolated consent interpreter off the gateway event loop."""
+    from tools.approval import classify_destructive_consent
+
+    return await asyncio.to_thread(
+        classify_destructive_consent, action_summary, utterance,
+    )
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -4853,17 +4862,26 @@ class TurnRunner:
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
                 try:
+                    _approval_kwargs = {
+                        "chat_id": ctx._status_chat_id,
+                        "command": cmd,
+                        "session_key": _approval_session_key,
+                        "description": desc,
+                        "metadata": ctx._status_thread_metadata,
+                        "allow_permanent": approval_data.get("allow_permanent", True),
+                        "allow_session": approval_data.get("allow_session", True),
+                        "smart_denied": approval_data.get("smart_denied", False),
+                    }
+                    # Exact transaction/user binding is currently rendered by
+                    # Discord. Other adapters retain their existing contract.
+                    if ctx._status_adapter.__class__.__module__.endswith("discord.adapter"):
+                        _approval_kwargs.update({
+                            "approval_id": approval_data.get("approval_id"),
+                            "approval_kind": approval_data.get("approval_kind"),
+                            "requester_user_id": approval_data.get("requester_user_id"),
+                        })
                     _approval_fut = safe_schedule_threadsafe(
-                        ctx._status_adapter.send_exec_approval(
-                            chat_id=ctx._status_chat_id,
-                            command=cmd,
-                            session_key=_approval_session_key,
-                            description=desc,
-                            metadata=ctx._status_thread_metadata,
-                            allow_permanent=approval_data.get("allow_permanent", True),
-                            allow_session=approval_data.get("allow_session", True),
-                            smart_denied=approval_data.get("smart_denied", False),
-                        ),
+                        ctx._status_adapter.send_exec_approval(**_approval_kwargs),
                         ctx._loop_for_step,
                         logger=logger,
                         log_message="send_exec_approval scheduling error",
@@ -8447,8 +8465,72 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # string.  The busy-handler path does not auto-send that return, so
         # we deliver it ourselves (mirroring the draining-case send above).
         try:
-            from tools.approval import has_blocking_approval
+            from tools.approval import (
+                get_pending_gateway_approval,
+                has_blocking_approval,
+                resolve_gateway_approval,
+            )
             if has_blocking_approval(session_key):
+                _destructive = get_pending_gateway_approval(
+                    session_key, approval_kind="destructive",
+                )
+                if _destructive is not None:
+                    _requester = str(_destructive.get("requester_user_id") or "")
+                    _speaker = str(event.source.user_id or "")
+                    if not _requester or _speaker != _requester:
+                        logger.warning(
+                            "Rejected destructive approval response from non-requester: "
+                            "session=%s requester=%s speaker=%s",
+                            session_key, _requester, _speaker,
+                        )
+                        return True
+                    _classification = await _classify_destructive_consent(
+                        str(_destructive.get("command") or ""),
+                        str(event.text or ""),
+                    )
+                    _decision = _classification.get("decision")
+                    _refers = _classification.get("refers_to_pending_action") is True
+                    if _decision == "approve" and _refers:
+                        _choice = "once"
+                    elif _decision == "deny" and _refers:
+                        _choice = "deny"
+                    else:
+                        _adapter = self._adapter_for_source(event.source)
+                        if _adapter:
+                            _anchor = self._reply_anchor_for_event(event)
+                            await _adapter._send_with_retry(
+                                chat_id=event.source.chat_id,
+                                content=(
+                                    "I couldn't tell whether that explicitly approves the "
+                                    "pending destructive action. Please clarify, or use the "
+                                    "Confirm once / Cancel buttons."
+                                ),
+                                reply_to=_anchor,
+                                metadata=self._thread_metadata_for_source(event.source, _anchor),
+                            )
+                        return True
+                    _count = resolve_gateway_approval(
+                        session_key,
+                        _choice,
+                        approval_id=str(_destructive.get("approval_id") or ""),
+                        requester_user_id=_speaker,
+                    )
+                    if _count:
+                        ctx_msg = (
+                            "Confirmed once. Continuing with that action."
+                            if _choice == "once"
+                            else "Cancelled. That action will not run."
+                        )
+                        _adapter = self._adapter_for_source(event.source)
+                        if _adapter:
+                            _anchor = self._reply_anchor_for_event(event)
+                            await _adapter._send_with_retry(
+                                chat_id=event.source.chat_id,
+                                content=ctx_msg,
+                                reply_to=_anchor,
+                                metadata=self._thread_metadata_for_source(event.source, _anchor),
+                            )
+                    return True
                 _raw_text = (event.text or "").strip().lower()
                 _approve_words = {"approve", "yes", "ok", "okay", "confirm", "y", "👍"}
                 _deny_words = {"deny", "no", "reject", "cancel", "n", "👎"}

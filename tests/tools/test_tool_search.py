@@ -241,6 +241,28 @@ class TestBridgeDispatch:
         # Will fail classification because unknown_xxx isn't deferrable.
         assert err is not None
 
+    def test_resolve_underlying_call_accepts_parameters_alias(self, monkeypatch):
+        from tools import tool_search
+
+        monkeypatch.setattr(tool_search, "is_deferrable_tool_name", lambda name: name == "mcp__demo")
+        name, call_args, err = tool_search.resolve_underlying_call({
+            "name": "mcp__demo",
+            "parameters": {"record_id": "123"},
+        })
+        assert err is None
+        assert name == "mcp__demo"
+        assert call_args == {"record_id": "123"}
+
+    def test_resolve_underlying_call_rejects_ambiguous_argument_shapes(self):
+        from tools.tool_search import resolve_underlying_call
+
+        _, _, err = resolve_underlying_call({
+            "name": "mcp__demo",
+            "arguments": {},
+            "parameters": {},
+        })
+        assert "both" in err
+
 
     def test_resolve_underlying_call_rejects_recursion(self):
         """tool_call cannot invoke tool_call itself."""
