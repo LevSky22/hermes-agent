@@ -16750,8 +16750,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # unsolicited write.  This value is intentionally never exported to a
         # subprocess environment; the MCP callback receives it through the
         # existing copy_context() bridge.
-        from gateway.session_context import set_current_user_utterance
+        from gateway.session_context import (
+            set_current_assistant_proposal,
+            set_current_user_utterance,
+        )
         set_current_user_utterance(message_text)
+
+        # A short approval such as "send it" may authorize a small workflow
+        # bundle, but only when the immediately preceding assistant response
+        # disclosed each side effect.  Capture that one user-visible proposal
+        # from the already-loaded transcript; do not expose tool results or a
+        # broader conversation window to the approval reviewer.
+        _prior_assistant_proposal = ""
+        for _prior_message in reversed(history or []):
+            if not isinstance(_prior_message, dict) or _prior_message.get("role") != "assistant":
+                continue
+            _prior_content = _prior_message.get("content", "")
+            if isinstance(_prior_content, str):
+                _prior_assistant_proposal = _prior_content
+            elif isinstance(_prior_content, list):
+                _prior_assistant_proposal = "\n".join(
+                    str(_part.get("text", ""))
+                    for _part in _prior_content
+                    if isinstance(_part, dict) and _part.get("type") in {"text", "output_text"}
+                )
+            break
+        set_current_assistant_proposal(_prior_assistant_proposal[:6000])
 
         # Stage the collected must-deliver notes for this turn's agent run
         # (one-shot; consumed in run_sync).  Staged AFTER the message_text

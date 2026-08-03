@@ -8,11 +8,14 @@ from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionContext, SessionSource
 from gateway.session_context import (
+    get_current_assistant_proposal,
     get_current_user_utterance,
     get_session_env,
+    set_current_assistant_proposal,
     set_current_user_utterance,
     set_session_vars,
     clear_session_vars,
+    reset_session_vars,
     _VAR_MAP,
 )
 
@@ -51,6 +54,22 @@ def test_current_user_utterance_survives_captured_context_handoff():
     assert get_current_user_utterance() == ""
     assert captured.copy().run(get_current_user_utterance) == (
         "Proceed with this exact action."
+    )
+
+
+def test_assistant_proposal_is_request_local_and_survives_context_handoff(monkeypatch):
+    monkeypatch.setenv("HERMES_CURRENT_ASSISTANT_PROPOSAL", "must-not-fallback")
+
+    set_current_assistant_proposal(
+        "I will send the message and update the named task status."
+    )
+    captured = contextvars.copy_context()
+    assert "HERMES_CURRENT_ASSISTANT_PROPOSAL" not in _VAR_MAP
+
+    reset_session_vars()
+    assert get_current_assistant_proposal() == ""
+    assert captured.copy().run(get_current_assistant_proposal) == (
+        "I will send the message and update the named task status."
     )
 
 
@@ -259,4 +278,3 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
         "user_id": "123456",
         "session_key": "agent:main:telegram:dm:2144471399",
     }
-

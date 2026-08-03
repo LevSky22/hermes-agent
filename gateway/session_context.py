@@ -103,6 +103,16 @@ _CURRENT_USER_UTTERANCE: ContextVar = ContextVar(
     "HERMES_CURRENT_USER_UTTERANCE", default=_UNSET
 )
 
+# The immediately preceding user-visible assistant proposal for the current
+# turn.  Like ``_CURRENT_USER_UTTERANCE`` this is private, request-local data:
+# it is deliberately absent from ``_VAR_MAP`` and therefore never exported to
+# subprocesses.  Smart MCP consent uses it to determine whether a short reply
+# such as "send it" authorizes every *disclosed* step in a bounded workflow,
+# without creating a standing provider or session allowance.
+_CURRENT_ASSISTANT_PROPOSAL: ContextVar = ContextVar(
+    "HERMES_CURRENT_ASSISTANT_PROPOSAL", default=_UNSET
+)
+
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
 # Whether the current session's delivery channel can route an ASYNC completion
@@ -217,6 +227,17 @@ def get_current_user_utterance() -> str:
     return "" if value is _UNSET else str(value or "")
 
 
+def set_current_assistant_proposal(proposal: str) -> None:
+    """Bind the last user-visible assistant proposal for this request."""
+    _CURRENT_ASSISTANT_PROPOSAL.set(str(proposal or ""))
+
+
+def get_current_assistant_proposal() -> str:
+    """Return the request-local assistant proposal without env fallback."""
+    value = _CURRENT_ASSISTANT_PROPOSAL.get()
+    return "" if value is _UNSET else str(value or "")
+
+
 def set_session_vars(
     platform: str = "",
     source: str = "",
@@ -305,6 +326,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
         _CURRENT_USER_UTTERANCE,
+        _CURRENT_ASSISTANT_PROPOSAL,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
@@ -361,6 +383,7 @@ def reset_session_vars() -> None:
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _CURRENT_USER_UTTERANCE.set(_UNSET)
+    _CURRENT_ASSISTANT_PROPOSAL.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 

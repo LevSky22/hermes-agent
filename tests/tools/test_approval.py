@@ -122,6 +122,7 @@ class TestSmartMCPMutationConsent:
     def test_reviewer_receives_current_utterance_and_can_approve_once(self):
         from gateway.session_context import (
             reset_session_vars,
+            set_current_assistant_proposal,
             set_current_user_utterance,
         )
 
@@ -129,6 +130,9 @@ class TestSmartMCPMutationConsent:
             choices=[SimpleNamespace(message=SimpleNamespace(content="APPROVE"))]
         )
         reset_session_vars()
+        set_current_assistant_proposal(
+            "I will send the prepared message to the named recipient."
+        )
         set_current_user_utterance("Send it.")
         try:
             with mock_patch(
@@ -145,6 +149,10 @@ class TestSmartMCPMutationConsent:
         assert result == "accept"
         review_payload = call.call_args.kwargs["messages"][1]["content"]
         assert "<human_utterance>\nSend it.\n</human_utterance>" in review_payload
+        assert (
+            "<assistant_proposal>\nI will send the prepared message to the named "
+            "recipient.\n</assistant_proposal>" in review_payload
+        )
         assert self.REQUEST in review_payload
 
     def test_missing_or_ambiguous_consent_falls_through_to_human_surface(self):
@@ -166,6 +174,7 @@ class TestSmartMCPMutationConsent:
 
         assert result == "decline"
         assert review.call_args.args[2] == ""
+        assert review.call_args.args[3] == ""
         assert prompt.call_count == 1
 
     def test_gateway_mcp_prompt_never_offers_standing_permission(self, monkeypatch):
