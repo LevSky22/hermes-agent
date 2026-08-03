@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import os
 
 import pytest
@@ -7,11 +8,12 @@ from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionContext, SessionSource
 from gateway.session_context import (
+    get_current_user_utterance,
     get_session_env,
+    set_current_user_utterance,
     set_session_vars,
     clear_session_vars,
     _VAR_MAP,
-    _UNSET,
 )
 
 
@@ -24,10 +26,32 @@ def _reset_contextvars():
     context, so a clear_session_vars() from test A (which sets vars to "")
     would leak into test B.  This fixture ensures each test starts clean.
     """
+    reset_session_vars()
     yield
-    for var in _VAR_MAP.values():
-        # Can't use var.reset() without a token; just set back to sentinel.
-        var.set(_UNSET)
+    reset_session_vars()
+
+
+def test_current_user_utterance_is_request_local_and_not_an_env_var(monkeypatch):
+    monkeypatch.setenv("HERMES_CURRENT_USER_UTTERANCE", "must-not-fallback")
+
+    assert get_current_user_utterance() == ""
+    set_current_user_utterance("Please send the prepared message.")
+    assert get_current_user_utterance() == "Please send the prepared message."
+    assert "HERMES_CURRENT_USER_UTTERANCE" not in _VAR_MAP
+
+    reset_session_vars()
+    assert get_current_user_utterance() == ""
+
+
+def test_current_user_utterance_survives_captured_context_handoff():
+    set_current_user_utterance("Proceed with this exact action.")
+    captured = contextvars.copy_context()
+    reset_session_vars()
+
+    assert get_current_user_utterance() == ""
+    assert captured.copy().run(get_current_user_utterance) == (
+        "Proceed with this exact action."
+    )
 
 
 def test_set_session_env_sets_contextvars(monkeypatch):
@@ -235,5 +259,4 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
         "user_id": "123456",
         "session_key": "agent:main:telegram:dm:2144471399",
     }
-
 

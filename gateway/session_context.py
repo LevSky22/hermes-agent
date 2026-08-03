@@ -93,6 +93,16 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 # private-chat topic (those lanes route only with thread id + reply anchor).
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
 
+# The fully prepared human utterance for the current agent turn.  This stays
+# in-process only: unlike the legacy HERMES_SESSION_* values it is deliberately
+# absent from _VAR_MAP, so raw chat content can never leak into a child process
+# environment.  MCP callbacks receive it through the existing copy_context()
+# bridge in tools/mcp_tool.py and can bind one approval decision to the exact
+# turn that commissioned the mutation.
+_CURRENT_USER_UTTERANCE: ContextVar = ContextVar(
+    "HERMES_CURRENT_USER_UTTERANCE", default=_UNSET
+)
+
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
 # Whether the current session's delivery channel can route an ASYNC completion
@@ -196,6 +206,17 @@ def scoped_current_session_id(session_id: str | None = None) -> Iterator[None]:
         _SESSION_ID.set(previous)
 
 
+def set_current_user_utterance(utterance: str) -> None:
+    """Bind the prepared human utterance for this request-local context."""
+    _CURRENT_USER_UTTERANCE.set(str(utterance or ""))
+
+
+def get_current_user_utterance() -> str:
+    """Return the current human utterance without any environment fallback."""
+    value = _CURRENT_USER_UTTERANCE.get()
+    return "" if value is _UNSET else str(value or "")
+
+
 def set_session_vars(
     platform: str = "",
     source: str = "",
@@ -283,6 +304,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _CURRENT_USER_UTTERANCE,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
@@ -338,6 +360,7 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _CURRENT_USER_UTTERANCE.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 

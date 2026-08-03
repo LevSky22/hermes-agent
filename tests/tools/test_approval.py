@@ -112,6 +112,97 @@ class TestSmartApproval:
         assert is_approved(session_key, pattern_key) is False
 
 
+class TestSmartMCPMutationConsent:
+    REQUEST = (
+        "effect=elevated client=example tool=proxy_request method=POST "
+        "path=/messages integration=messaging connection=primary "
+        "body_sha256=abc123"
+    )
+
+    def test_reviewer_receives_current_utterance_and_can_approve_once(self):
+        from gateway.session_context import (
+            reset_session_vars,
+            set_current_user_utterance,
+        )
+
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="APPROVE"))]
+        )
+        reset_session_vars()
+        set_current_user_utterance("Send it.")
+        try:
+            with mock_patch(
+                "tools.approval._get_approval_mode", return_value="smart"
+            ), mock_patch(
+                "agent.auxiliary_client.call_llm", return_value=response
+            ) as call:
+                result = approval_module.request_elicitation_consent(
+                    self.REQUEST, "approve one bounded write"
+                )
+        finally:
+            reset_session_vars()
+
+        assert result == "accept"
+        review_payload = call.call_args.kwargs["messages"][1]["content"]
+        assert "<human_utterance>\nSend it.\n</human_utterance>" in review_payload
+        assert self.REQUEST in review_payload
+
+    def test_missing_or_ambiguous_consent_falls_through_to_human_surface(self):
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
+        with mock_patch(
+            "tools.approval._get_approval_mode", return_value="smart"
+        ), mock_patch(
+            "tools.approval._smart_review_mcp_elicitation", return_value="escalate"
+        ) as review, mock_patch(
+            "tools.approval._is_gateway_approval_context", return_value=False
+        ), mock_patch(
+            "tools.approval.prompt_dangerous_approval", return_value="deny"
+        ) as prompt:
+            result = approval_module.request_elicitation_consent(
+                self.REQUEST, "approve one bounded write"
+            )
+
+        assert result == "decline"
+        assert review.call_args.args[2] == ""
+        assert prompt.call_count == 1
+
+    def test_gateway_mcp_prompt_never_offers_standing_permission(self, monkeypatch):
+        session_key = "agent:main:discord:thread:example"
+        seen = {}
+
+        monkeypatch.setattr(
+            approval_module, "get_current_session_key", lambda: session_key
+        )
+        monkeypatch.setattr(
+            approval_module, "_is_gateway_approval_context", lambda: True
+        )
+        monkeypatch.setattr(
+            approval_module, "_get_approval_mode", lambda: "manual"
+        )
+        monkeypatch.setitem(
+            approval_module._gateway_notify_cbs, session_key, lambda _data: None
+        )
+
+        def await_decision(_session_key, _notify_cb, data, **_kwargs):
+            seen.update(data)
+            return {"resolved": True, "choice": "once"}
+
+        monkeypatch.setattr(
+            approval_module, "_await_gateway_decision", await_decision
+        )
+
+        result = approval_module.request_elicitation_consent(
+            self.REQUEST, "approve one bounded write"
+        )
+
+        assert result == "accept"
+        assert seen["approval_kind"] == "mcp_mutation"
+        assert seen["allow_session"] is False
+        assert seen["allow_permanent"] is False
+
+
 class TestDetectDangerousRm:
     def test_rm_flags_after_operands_detected(self):
         # GNU rm permutes options: `rm build/ -rf` == `rm -rf build/`.

@@ -16744,6 +16744,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
 
+        # Preserve the exact prepared utterance in request-local context so an
+        # MCP elicitation raised later in this tool call can distinguish an
+        # explicitly commissioned mutation (for example, "send it") from an
+        # unsolicited write.  This value is intentionally never exported to a
+        # subprocess environment; the MCP callback receives it through the
+        # existing copy_context() bridge.
+        from gateway.session_context import set_current_user_utterance
+        set_current_user_utterance(message_text)
+
         # Stage the collected must-deliver notes for this turn's agent run
         # (one-shot; consumed in run_sync).  Staged AFTER the message_text
         # early-out above so an aborted turn cannot leak its notes into the
