@@ -307,6 +307,11 @@ def _ensure_mcp_sdk() -> bool:
             try:
                 from mcp.client.streamable_http import streamable_http_client
                 _MCP_NEW_HTTP = True
+                # mcp >= 1.28 removed the deprecated ``streamablehttp_client``
+                # alias.  The supported underscored client is sufficient for
+                # HTTP transport, so do not leave availability false merely
+                # because the legacy alias is absent.
+                _MCP_HTTP_AVAILABLE = True
             except ImportError:
                 _MCP_NEW_HTTP = False
             try:
